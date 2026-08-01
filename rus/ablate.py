@@ -42,28 +42,21 @@ def project_direction_from_weight(
 
 
 # ── 8-bit (bitsandbytes) weight support ─────────────────────────────────
-# Linear8bitLt stores weights as int8 blocks + fp16 scales (SCB). We cannot
-# project int8 tensors, and writing fp16 into them would be a silent no-op.
-# Instead: dequantize → project in fp16 → re-quantize with the same absmax
-# block scheme → write back. Matches bnb's dynamic absmax 8-bit layout.
+# bnb's Linear8bitLt keeps int8 blocks (CB) + fp16 scales (SCB), and the
+# storage layout differs across bnb/transformers versions (attributes on the
+# weight param vs. on the module state). Writing back into those slots proved
+# unreliable, so we never mutate them. Instead we:
+#   1. read the authoritative CB/SCB pair via module.state_dict() — bnb's own
+#      method, always correct,
+#   2. dequantize → project in fp16,
+#   3. REPLACE the module with a plain fp16 nn.Linear holding the projected
+#      weights. Only the ablated targets become fp16 (~MBs), the rest of the
+#      model stays 8-bit. The exporter saves state dicts, so the checkpoint
+#      (mixed fp16 + bnb 8-bit) is a valid transformers checkpoint.
 
 
-def _get_scb(weight, module=None) -> Optional[torch.Tensor]:
-    """
-    Locate the fp16 scale tensor. Depending on the bnb/transformers version it
-    lives on the Int8Params (weight.SCB) or on the module's MatmulLtState.
-    """
-    scb = getattr(weight, "SCB", None)
-    if scb is None and module is not None:
-        state = getattr(module, "state", None)
-        if state is not None:
-            scb = getattr(state, "SCB", None)
-    return scb
-
-
-def _quant_block_size(weight, scb: torch.Tensor) -> int:
-    """Infer the bnb quantization block size from the stored scale tensor."""
-    cb = weight.data if hasattr(weight, "data") else weight
+def _block_size(cb: torch.Tensor, scb: torch.Tensor) -> int:
+    """Infer the bnb quantization block size from CB/SCB shapes."""
     numel = cb.numel()
     n_scales = scb.numel()
     if n_scales == 0 or numel % n_scales != 0:
@@ -71,76 +64,87 @@ def _quant_block_size(weight, scb: torch.Tensor) -> int:
     return numel // n_scales
 
 
-def dequantize_8bit(weight, scb: Optional[torch.Tensor] = None) -> torch.Tensor:
+def dequantize_8bit(cb: torch.Tensor, scb: torch.Tensor) -> torch.Tensor:
     """
-    Convert an 8-bit quantized weight (int8 data + SCB scales) to fp16.
-    Scale layout: every `block_size` flattened elements share one scale.
+    Convert 8-bit blocks (int8 CB + fp16 absmax scales) to fp16.
+    Every `block_size` flattened elements share one scale (bnb absmax scheme).
     """
-    cb = weight.data if hasattr(weight, "data") else weight
-    if scb is None:
-        scb = getattr(weight, "SCB", None)
-    if scb is None:
-        raise RuntimeError("8-bit weight has no SCB scale tensor.")
-    block = _quant_block_size(weight, scb)
-
+    block = _block_size(cb, scb)
     fp = cb.float().reshape(-1, block) * (scb.float().reshape(-1, 1) / 127.0)
     return fp.reshape(cb.shape).to(torch.float16)
 
 
-def requantize_8bit(fp16_weight: torch.Tensor, block: int) -> tuple:
+def _replace_with_fp16_linear(model, layer_path: str, tag: str, fp16_weights: torch.Tensor, bias=None) -> None:
     """
-    Quantize an fp16 matrix back into bnb's dynamic absmax 8-bit format.
-    Returns (int8_tensor, fp16_scales) with one scale per `block` elements.
+    Swap the bnb 8-bit module for a plain fp16 nn.Linear with the projected
+    weights. The rest of the model keeps its 8-bit layout.
     """
-    flat = fp16_weight.float().reshape(-1, block)
-    absmax = flat.abs().amax(dim=1)
-    scaled = torch.clamp(torch.round(flat * (127.0 / absmax.clamp_min(1e-12).unsqueeze(1))), -127, 127)
-    return scaled.reshape(fp16_weight.shape).to(torch.int8), absmax.half().reshape(-1)
+    import torch.nn as nn
+
+    suffix = {
+        "o_proj": "self_attn.o_proj",
+        "c_proj": "self_attn.c_proj",
+        "wo": "attention.wo",
+        "down_proj": "mlp.down_proj",
+        "c_proj_mlp": "mlp.c_proj",
+        "fc2": "mlp.fc2",
+    }.get(tag)
+    if suffix is None:
+        raise RuntimeError(f"No module path mapping for target tag: {tag}")
+
+    parent = model
+    parts = f"{layer_path}.{suffix}".split(".")
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+    attr = parts[-1]
+
+    in_features, out_features = fp16_weights.shape[1], fp16_weights.shape[0]
+    new_layer = nn.Linear(in_features, out_features, bias=bias is not None)
+    new_layer = new_layer.to(device=fp16_weights.device, dtype=fp16_weights.dtype)
+    with torch.no_grad():
+        new_layer.weight.copy_(fp16_weights.contiguous())
+        if bias is not None:
+            new_layer.bias.copy_(bias)
+        new_layer.weight.requires_grad = False
+        if new_layer.bias is not None:
+            new_layer.bias.requires_grad = False
+
+    setattr(parent, attr, new_layer)
+    return new_layer
 
 
-def _write_quantized_weight(module, cb: torch.Tensor, scb: torch.Tensor) -> None:
-    """Write re-quantized CB/SCB back into the bnb module (all storage slots)."""
-    weight = module.weight
-    weight.data = cb
-    if hasattr(weight, "SCB"):
-        weight.SCB = scb
-    state = getattr(module, "state", None)
-    if state is not None:
-        if hasattr(state, "CB"):
-            state.CB = cb
-        if hasattr(state, "SCB"):
-            state.SCB = scb
-        if hasattr(state, "has_fp16_weights"):
-            state.has_fp16_weights = False
+def _ablate_quantized_target(model, layer_path: str, tag: str, module, direction: torch.Tensor,
+                             coefficient: float) -> Dict[str, float]:
+    """Dequantize (via module.state_dict) → project → swap in fp16 Linear."""
+    sd = module.state_dict()
+    cb = sd.get("weight")
+    scb = sd.get("weight.SCB")
+    if cb is None or scb is None:
+        raise RuntimeError(
+            f"Unsupported bitsandbytes layout for {module.__class__.__name__}: "
+            f"state_dict keys = {list(sd.keys())}"
+        )
 
-
-def _ablate_quantized_target(module, direction: torch.Tensor, coefficient: float) -> Dict[str, float]:
-    """Dequantize → project → requantize for one 8-bit weight matrix."""
-    weight = module.weight
-    scb = _get_scb(weight, module)
-    fp16 = dequantize_8bit(weight, scb)
-    device = getattr(weight, "device", None) or fp16.device
-    fp16 = fp16.to(device)
-    dir_fp16 = direction.to(device, torch.float16)
+    fp16 = dequantize_8bit(cb, scb).to(cb.device)
+    dir_fp16 = direction.to(fp16.device, torch.float16)
 
     proj_before = (dir_fp16 @ fp16).abs().mean().item()
     fp16_modified = project_direction_from_weight(fp16, dir_fp16, coefficient)
     proj_after = (dir_fp16 @ fp16_modified).abs().mean().item()
 
-    block = _quant_block_size(weight, scb)
-    new_cb, new_scb = requantize_8bit(fp16_modified, block)
-    _write_quantized_weight(module, new_cb, new_scb)
+    bias = None
+    if hasattr(module, "bias") and module.bias is not None:
+        bias = module.bias.detach().to(torch.float16)
 
-    # VERIFY the write-back took effect in the module's live storage.
-    # If bnb keeps the weights elsewhere (wrong SCB slot etc.) this catches it
-    # instead of silently saving an unmodified model.
-    check_fp16 = dequantize_8bit(module.weight, _get_scb(module.weight, module))
-    check_proj = (dir_fp16 @ check_fp16).abs().mean().item()
+    new_module = _replace_with_fp16_linear(model, layer_path, tag, fp16_modified, bias)
+
+    # VERIFY: the live module now holds weights with the direction removed.
+    # Plain fp16 weights — measurement is deterministic, no bnb layout tricks.
+    check_proj = (dir_fp16 @ new_module.weight).abs().mean().item()  # module now nn.Linear
     if check_proj > proj_before * 0.5:
         raise RuntimeError(
-            f"8-bit write-back did not take effect "
-            f"(projection {proj_before:.5f} -> {check_proj:.5f}). "
-            f"Unsupported bitsandbytes layout for {module.__class__.__name__}."
+            f"Ablation did not take effect in the module "
+            f"(projection {proj_before:.5f} -> {check_proj:.5f})."
         )
 
     return {
@@ -166,15 +170,15 @@ def apply_ablation_to_layer(
 
     for tag, weight in targets.items():
         module = _find_module(model, layer_path, tag)
-        scb = _get_scb(weight, module)
-        is_quant = weight.dtype in (torch.int8, torch.uint8) or hasattr(weight, "SCB") or scb is not None
+        if module is None:
+            raise RuntimeError(f"Cannot locate module for {layer_path}.{tag}")
 
-        if is_quant:
-            if module is None:
-                raise RuntimeError(f"8-bit weight found but module not located: {layer_path}.{tag}")
-            stats[tag] = _ablate_quantized_target(module, direction, coefficient)
+        sd = module.state_dict()
+        if "weight.SCB" in sd:  # bnb 8-bit module
+            stats[tag] = _ablate_quantized_target(model, layer_path, tag, module, direction, coefficient)
             continue
 
+        # Plain fp16 path
         direction_dev = direction.to(weight.device, weight.dtype)
 
         proj_before = (direction_dev @ weight).abs().mean().item()

@@ -29,31 +29,38 @@ def collect_activations(
 
     all_hidden = {}  # layer_idx -> [tensor(batch, hidden_dim), ...]
 
-    for i in tqdm(range(0, len(prompts), batch_size), desc="Collecting activations", unit="batch"):
-        batch_prompts = prompts[i : i + batch_size]
+    try:
+        for i in tqdm(range(0, len(prompts), batch_size), desc="Collecting activations", unit="batch"):
+            batch_prompts = prompts[i : i + batch_size]
 
-        enc = tokenizer(
-            batch_prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=max_length,
-        )
-        enc = {k: v.to(device) for k, v in enc.items()}
+            enc = tokenizer(
+                batch_prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+            )
+            enc = {k: v.to(device) for k, v in enc.items()}
 
-        with torch.no_grad():
-            outputs = model(**enc)
+            with torch.no_grad():
+                outputs = model(**enc)
 
-        hidden_states = outputs.hidden_states  # tuple of (batch, seq_len, hidden_dim)
-        last_positions = enc["attention_mask"].sum(dim=1) - 1
+            hidden_states = outputs.hidden_states  # tuple (num_layers+1, batch, seq, hidden)
+            last_positions = enc["attention_mask"].sum(dim=1) - 1
 
-        for layer_idx, hs in enumerate(hidden_states):
-            last_hidden = hs[range(len(batch_prompts)), last_positions, :]
-            if layer_idx not in all_hidden:
-                all_hidden[layer_idx] = []
-            all_hidden[layer_idx].append(last_hidden.cpu())
+            # hidden_states[i] is the input to layer i (i=0: embeddings);
+            # hidden_states[i+1] is layer i's OUTPUT. Store under key `i` so the
+            # refusal direction for layer i matches the weights we ablate there.
+            for layer_idx, hs in enumerate(hidden_states):
+                if layer_idx == 0:
+                    continue
+                last_hidden = hs[range(len(batch_prompts)), last_positions, :]
+                if (layer_idx - 1) not in all_hidden:
+                    all_hidden[layer_idx - 1] = []
+                all_hidden[layer_idx - 1].append(last_hidden.cpu())
+    finally:
+        model.config.output_hidden_states = False
 
-    model.config.output_hidden_states = False
     return all_hidden
 
 

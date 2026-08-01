@@ -69,6 +69,9 @@ def rank_layers(
     Rank layers by refusal signal strength, skipping boundary layers.
     Returns list of (layer_idx, score, direction) sorted by score descending.
     """
+    if not directions:
+        return []
+
     total_layers = max(directions.keys()) + 1
 
     ranked = []

@@ -14,8 +14,6 @@ Or step-by-step:
     engine.save()
 """
 
-import time
-import copy
 import torch
 from typing import List, Optional, Dict, Tuple
 
@@ -105,6 +103,7 @@ class RusEngine:
         self.directions = compute_refusal_directions(
             harmful_acts, harmless_acts, self.num_layers
         )
+        self._analyzed_prompts = n
 
         self.ranked_layers = rank_layers(
             self.directions,
@@ -143,8 +142,8 @@ class RusEngine:
         if not self.directions:
             self.analyze()
 
-        top_k = k or TOP_K_LAYERS
-        coeff = coefficient or DEFAULT_COEFFICIENT
+        top_k = k if k is not None else TOP_K_LAYERS
+        coeff = coefficient if coefficient is not None else DEFAULT_COEFFICIENT
 
         if layers:
             self.selected_layers = [
@@ -168,6 +167,13 @@ class RusEngine:
         """Run before/after comparison. Loads fresh copy of original model."""
         if self.model is None:
             raise RuntimeError("No ablated model. Call load() + ablate() first.")
+
+        if self.load_in_8bit and torch.cuda.is_available():
+            print(
+                "Warning: 8-bit mode holds the ablated model on GPU; loading the "
+                "original alongside it may OOM on 12-16GB cards. Use "
+                "engine.save() first, then compare the saved copy (see notebook)."
+            )
 
         print("Loading original model for comparison...")
         self.model_before, _ = load_model_and_tokenizer(
@@ -205,7 +211,7 @@ class RusEngine:
             layer_scores = {l: self.directions[l]["score"] for l in self.directions}
             log_run(
                 model_name=self.model_name,
-                num_prompts=len(HARMFUL_PROMPTS),
+                num_prompts=getattr(self, "_analyzed_prompts", len(HARMFUL_PROMPTS)),
                 top_k=len(self.selected_layers),
                 coefficient=DEFAULT_COEFFICIENT,
                 layers_modified=[s[0] for s in self.selected_layers],

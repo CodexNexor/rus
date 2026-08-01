@@ -2,9 +2,10 @@
 RUS Model Loader — downloads from HuggingFace, discovers architecture, returns hooks-ready model.
 """
 
+import logging
 import torch
 import gc
-from typing import Optional, Tuple, List, Dict
+from typing import Tuple, List, Dict
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -14,6 +15,11 @@ from transformers import (
 )
 
 from .config import DEFAULT_DTYPE, DEFAULT_DEVICE_MAP, TRUST_REMOTE_CODE
+
+# Stop bitsandbytes flooding output with "inputs will be cast from bf16 to fp16"
+# style warnings. With fp16 compute dtype (set below) these are unnecessary.
+logging.getLogger("bitsandbytes").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 
 def load_model_and_tokenizer(
@@ -47,11 +53,19 @@ def load_model_and_tokenizer(
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_quant_type="nf4",
         )
+        # fp16 compute dtype stops bnb casting bf16 inputs on every forward
+        kwargs["torch_dtype"] = torch.float16
     elif load_in_8bit:
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_8bit=True,
+            bnb_8bit_compute_dtype=torch.float16,
         )
+        # MUST pass torch_dtype=float16: without it transformers uses the
+        # config's bf16 and bitsandbytes re-casts to fp16 on every matmul,
+        # flooding logs and wasting time on unsupported T4 bf16 paths.
+        kwargs["torch_dtype"] = torch.float16
     else:
         kwargs["torch_dtype"] = dtype
 

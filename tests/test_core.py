@@ -20,19 +20,41 @@ from rus.ablate import (
 from rus.exporter import _shard_state_dict, _save_shards
 
 
-class FakeBnbModule:
-    """Mimics Linear8bitLt's state_dict + bias slots (bnb's own layout)."""
+class _Int8Param(torch.Tensor):
+    """Mimics bnb's Int8Params: a Tensor whose .SCB attr holds the scales."""
 
-    def __init__(self, cb, scb):
+    @staticmethod
+    def __new__(cls, cb, scb):
+        obj = torch.Tensor._make_subclass(cls, cb)
+        obj.SCB = scb
+        return obj
+
+
+class FakeBnbModule:
+    """Mimics Linear8bitLt, in two real-world layouts:
+
+    layout="state_dict" — state_dict exposes the "weight.SCB" key (newer bnb)
+    layout="param_attr" — state_dict exposes only "weight"; SCB sits on the
+                          weight param's .SCB attribute (transformers wrapper)
+    """
+
+    def __init__(self, cb, scb, layout="state_dict"):
         self._cb = cb
         self._scb = scb
+        self._layout = layout
         self.bias = None
+        if layout == "param_attr":
+            self._weight_param = _Int8Param(cb, scb)
 
     def state_dict(self):
+        if self._layout == "param_attr":
+            return {"weight": self._weight_param}
         return {"weight": self._cb, "weight.SCB": self._scb}
 
     @property
     def weight(self):
+        if self._layout == "param_attr":
+            return self._weight_param
         return self._cb
 
 
@@ -166,7 +188,7 @@ def test_select_best_layers():
 
 
 def test_quantized_scb_layouts():
-    """Works regardless of where bnb stashes CB/SCB — state_dict is canonical."""
+    """Works regardless of where bnb stashes CB/SCB (state_dict key or param attr)."""
     from rus.ablate import _ablate_quantized_target
 
     torch.manual_seed(3)
@@ -174,14 +196,12 @@ def test_quantized_scb_layouts():
     cb, scb = quantize_absmax(w, 64)
     v = torch.randn(256).half()
 
-    for make in (
-        lambda: FakeBnbModule(cb, scb),                       # weight has no SCB attr at all
-        lambda: FakeBnbModule(cb, scb),                       # same — state_dict driven
-    ):
-        mod = make()
+    for layout in ("state_dict", "param_attr"):
+        mod = FakeBnbModule(cb, scb, layout=layout)
         model = _fake_model_with_module(mod)
         stats = _ablate_quantized_target(model, "model.layers.0", "o_proj", mod, v, coefficient=0.8)
         assert stats["reduction"] > 0.7, stats
+        assert isinstance(model.model.layers._items[0].self_attn.o_proj, torch.nn.Linear)
     print("PASS test_quantized_scb_layouts")
 
 
@@ -190,8 +210,8 @@ def test_apply_ablation_raises_on_failure():
     from rus.ablate import apply_ablation
 
     good = FakeBnbModule(*quantize_absmax((torch.randn(256, 256) * 0.02).half(), 64))
-    bad = FakeBnbModule(*quantize_absmax((torch.randn(256, 256) * 0.02).half(), 64))
-    bad._scb = None  # state_dict reports SCB=None -> layout check must raise
+    bad_cb, _ = quantize_absmax((torch.randn(256, 256) * 0.02).half(), 64)
+    bad = FakeBnbModule(bad_cb, torch.randn(10, 10))  # SCB garbage -> block inference must raise
 
     model = type("M", (), {})()
     model.model = type("Inner", (), {})()

@@ -113,12 +113,32 @@ def _replace_with_fp16_linear(model, layer_path: str, tag: str, fp16_weights: to
     return new_layer
 
 
+def _extract_cb_scb(module, sd: Dict) -> tuple:
+    """
+    Resolve the CB/SCB pair from a bnb 8-bit module, regardless of where bnb
+    stashes the scales. Variants seen in the wild:
+      a) state_dict has a "weight.SCB" key,
+      b) SCB lives as an attribute on the weight param itself (Int8Params.SCB),
+         and state_dict only exposes "weight".
+    Returns (cb, scb) or (None, None) for a non-8-bit module.
+    """
+    cb = sd.get("weight")
+    if not isinstance(cb, torch.Tensor):
+        return None, None
+    scb = sd.get("weight.SCB")
+    if scb is None:
+        w = getattr(module, "weight", None)
+        scb = getattr(w, "SCB", None) if w is not None else None
+    if not isinstance(scb, torch.Tensor):
+        return None, None
+    return cb, scb
+
+
 def _ablate_quantized_target(model, layer_path: str, tag: str, module, direction: torch.Tensor,
                              coefficient: float) -> Dict[str, float]:
     """Dequantize (via module.state_dict) → project → swap in fp16 Linear."""
     sd = module.state_dict()
-    cb = sd.get("weight")
-    scb = sd.get("weight.SCB")
+    cb, scb = _extract_cb_scb(module, sd)
     if cb is None or scb is None:
         raise RuntimeError(
             f"Unsupported bitsandbytes layout for {module.__class__.__name__}: "
@@ -174,7 +194,8 @@ def apply_ablation_to_layer(
             raise RuntimeError(f"Cannot locate module for {layer_path}.{tag}")
 
         sd = module.state_dict()
-        if "weight.SCB" in sd:  # bnb 8-bit module
+        cb, scb = _extract_cb_scb(module, sd)
+        if cb is not None and scb is not None:  # bnb 8-bit module (either layout)
             stats[tag] = _ablate_quantized_target(model, layer_path, tag, module, direction, coefficient)
             continue
 

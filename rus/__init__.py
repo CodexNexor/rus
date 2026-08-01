@@ -19,7 +19,7 @@ CLI:
     python -m rus Qwen/Qwen2.5-7B-Instruct --8bit -n 64 -k 5 -c 0.8
 """
 
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 
 from .api import RusEngine, ablate
 from .cli import main  # for console script entry point

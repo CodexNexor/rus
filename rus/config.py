@@ -22,7 +22,7 @@ ACTIVATION_LAYERS = ["residual"]  # types to collect
 
 # ── Subspace Analysis ──────────────────────────────────
 PCA_COMPONENTS = 1
-MIN_REFUSAL_SCORE = 0.3  # layers below this threshold are ignored
+MIN_REFUSAL_SCORE = 0.0  # rank-based selection; never empties top-k
 TOP_K_LAYERS = 5  # how many layers to ablate by default
 
 # ── Ablation ───────────────────────────────────────────

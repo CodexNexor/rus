@@ -134,9 +134,21 @@ def test_exporter_shards(tmp="/tmp/rus_export_test"):
     print("PASS test_exporter_shards")
 
 
+def test_select_best_layers():
+    """Low absolute scores (normal with many prompts) must still yield top-k."""
+    from rus.subspace import select_best_layers
+
+    ranked = [(2, 0.28, torch.randn(8)), (3, 0.23, torch.randn(8)), (4, 0.19, torch.randn(8))]
+    selected = select_best_layers(ranked, top_k=2, min_score=0.3)
+    assert [l for l, _, _ in selected] == [2, 3], "rank-based fallback failed"
+    assert select_best_layers([], top_k=2) == []
+    print("PASS test_select_best_layers")
+
+
 if __name__ == "__main__":
     test_round_trip()
     test_projection()
     test_quantized_ablation_path()
     test_exporter_shards()
+    test_select_best_layers()
     print("\nAll tests passed ✓")

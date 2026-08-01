@@ -89,10 +89,18 @@ def rank_layers(
 def select_best_layers(
     ranked: List[Tuple[int, float, torch.Tensor]],
     top_k: int = 5,
-    min_score: float = 0.3,
+    min_score: float = 0.0,
 ) -> List[Tuple[int, float, torch.Tensor]]:
     """
-    Pick the top-k layers above min_score threshold.
+    Pick the top-k layers by refusal score.
+
+    min_score is only a filter when there ARE qualifying layers. With many
+    prompts the PCA explained-variance ratios are naturally low (0.1-0.3),
+    so an absolute threshold must never empty the selection — ranking decides.
     """
+    if not ranked:
+        return []
     selected = [(l, s, d) for l, s, d in ranked if s >= min_score]
+    if not selected:
+        return ranked[:top_k]
     return selected[:top_k]

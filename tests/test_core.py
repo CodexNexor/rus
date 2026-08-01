@@ -17,6 +17,7 @@ from rus.ablate import (
     requantize_8bit,
     project_direction_from_weight,
     _quant_block_size,
+    _get_scb,
 )
 from rus.exporter import _shard_state_dict, _save_shards
 
@@ -56,8 +57,8 @@ def test_round_trip():
     for block in (64, 128, 256):
         cb, scb = quantize_absmax(w, block)
         fake = FakeQuantWeight(cb, scb)
-        assert _quant_block_size(fake) == block, f"block detect {block}"
-        deq = dequantize_8bit(fake)
+        assert _quant_block_size(fake, scb) == block, f"block detect {block}"
+        deq = dequantize_8bit(fake, scb)
         rel_err = (deq.float() - w.float()).abs().mean() / w.float().abs().mean()
         assert rel_err < 0.02, f"dequant rel err {rel_err:.4f}"
         cb2, scb2 = requantize_8bit(deq, block)
@@ -145,10 +146,58 @@ def test_select_best_layers():
     print("PASS test_select_best_layers")
 
 
+def test_quantized_scb_on_state_only():
+    """SCB lives on module.state.SCB, not weight.SCB (bnb layout variant)."""
+    from rus.ablate import _ablate_quantized_target
+
+    torch.manual_seed(3)
+    w = (torch.randn(256, 256) * 0.02).half()
+    cb, scb = quantize_absmax(w, 64)
+    mod = FakeBnbModule(cb, scb)
+    del mod.weight.SCB  # simulate the variant where weight has no SCB
+    mod.state.SCB = scb
+
+    v = torch.randn(256).half()
+    stats = _ablate_quantized_target(mod, v, coefficient=0.8)
+    assert stats["reduction"] > 0.7, stats
+
+    deq = dequantize_8bit(mod.weight, _get_scb(mod.weight, mod))
+    vn = v / v.norm()
+    before = (vn @ w).abs().mean().item()
+    after = (vn @ deq).abs().mean().item()
+    assert after < before * 0.3, f"{before} -> {after}"
+    print(f"PASS test_quantized_scb_on_state_only ({before:.4f} -> {after:.4f})")
+
+
+def test_apply_ablation_raises_on_failure():
+    """Ablation errors must propagate, never be swallowed."""
+    from rus.ablate import apply_ablation
+
+    good = FakeBnbModule(*quantize_absmax((torch.randn(256, 256) * 0.02).half(), 64))
+    bad = FakeBnbModule(*quantize_absmax((torch.randn(256, 256) * 0.02).half(), 64))
+    del bad.weight.data  # corrupt storage -> must raise
+
+    model = type("M", (), {})()
+    model.layers = [good, bad]
+    good.self_attn = type("S", (), {"o_proj": good})()
+    bad.self_attn = type("S", (), {"o_proj": bad})()
+    layer_paths = ["model.layers.0", "model.layers.1"]
+    v = torch.randn(256)
+    selected = [(0, 0.5, v), (1, 0.4, v)]
+
+    try:
+        apply_ablation(model, selected, layer_paths)
+        raise AssertionError("expected an exception to propagate")
+    except (RuntimeError, AttributeError, TypeError):
+        print("PASS test_apply_ablation_raises_on_failure")
+
+
 if __name__ == "__main__":
     test_round_trip()
     test_projection()
     test_quantized_ablation_path()
+    test_quantized_scb_on_state_only()
+    test_apply_ablation_raises_on_failure()
     test_exporter_shards()
     test_select_best_layers()
     print("\nAll tests passed ✓")

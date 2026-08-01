@@ -4,7 +4,7 @@ Permanently modifies the model so it can no longer represent refusal.
 """
 
 import torch
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from tqdm import tqdm
 
 from .loader import get_weight_targets, discover_layers
@@ -48,17 +48,22 @@ def project_direction_from_weight(
 # block scheme → write back. Matches bnb's dynamic absmax 8-bit layout.
 
 
-def _is_quantized_weight(weight) -> bool:
-    """True when a weight tensor is a bnb Int8Params/int8 storage."""
-    return weight.dtype in (torch.int8, torch.uint8) or hasattr(weight, "SCB")
+def _get_scb(weight, module=None) -> Optional[torch.Tensor]:
+    """
+    Locate the fp16 scale tensor. Depending on the bnb/transformers version it
+    lives on the Int8Params (weight.SCB) or on the module's MatmulLtState.
+    """
+    scb = getattr(weight, "SCB", None)
+    if scb is None and module is not None:
+        state = getattr(module, "state", None)
+        if state is not None:
+            scb = getattr(state, "SCB", None)
+    return scb
 
 
-def _quant_block_size(weight) -> int:
+def _quant_block_size(weight, scb: torch.Tensor) -> int:
     """Infer the bnb quantization block size from the stored scale tensor."""
     cb = weight.data if hasattr(weight, "data") else weight
-    scb = getattr(weight, "SCB", None)
-    if scb is None:
-        raise RuntimeError("8-bit weight has no SCB scale tensor.")
     numel = cb.numel()
     n_scales = scb.numel()
     if n_scales == 0 or numel % n_scales != 0:
@@ -66,16 +71,19 @@ def _quant_block_size(weight) -> int:
     return numel // n_scales
 
 
-def dequantize_8bit(weight) -> torch.Tensor:
+def dequantize_8bit(weight, scb: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Convert an 8-bit quantized weight (int8 data + SCB scales) to fp16.
     Scale layout: every `block_size` flattened elements share one scale.
     """
     cb = weight.data if hasattr(weight, "data") else weight
-    scb = getattr(weight, "SCB")
-    block = _quant_block_size(weight)
+    if scb is None:
+        scb = getattr(weight, "SCB", None)
+    if scb is None:
+        raise RuntimeError("8-bit weight has no SCB scale tensor.")
+    block = _quant_block_size(weight, scb)
 
-    fp = cb.float().reshape(-1, block) * (scb.reshape(-1, 1) / 127.0)
+    fp = cb.float().reshape(-1, block) * (scb.float().reshape(-1, 1) / 127.0)
     return fp.reshape(cb.shape).to(torch.float16)
 
 
@@ -109,7 +117,8 @@ def _write_quantized_weight(module, cb: torch.Tensor, scb: torch.Tensor) -> None
 def _ablate_quantized_target(module, direction: torch.Tensor, coefficient: float) -> Dict[str, float]:
     """Dequantize → project → requantize for one 8-bit weight matrix."""
     weight = module.weight
-    fp16 = dequantize_8bit(weight)
+    scb = _get_scb(weight, module)
+    fp16 = dequantize_8bit(weight, scb)
     device = getattr(weight, "device", None) or fp16.device
     fp16 = fp16.to(device)
     dir_fp16 = direction.to(device, torch.float16)
@@ -118,9 +127,21 @@ def _ablate_quantized_target(module, direction: torch.Tensor, coefficient: float
     fp16_modified = project_direction_from_weight(fp16, dir_fp16, coefficient)
     proj_after = (dir_fp16 @ fp16_modified).abs().mean().item()
 
-    block = _quant_block_size(weight)
+    block = _quant_block_size(weight, scb)
     new_cb, new_scb = requantize_8bit(fp16_modified, block)
     _write_quantized_weight(module, new_cb, new_scb)
+
+    # VERIFY the write-back took effect in the module's live storage.
+    # If bnb keeps the weights elsewhere (wrong SCB slot etc.) this catches it
+    # instead of silently saving an unmodified model.
+    check_fp16 = dequantize_8bit(module.weight, _get_scb(module.weight, module))
+    check_proj = (dir_fp16 @ check_fp16).abs().mean().item()
+    if check_proj > proj_before * 0.5:
+        raise RuntimeError(
+            f"8-bit write-back did not take effect "
+            f"(projection {proj_before:.5f} -> {check_proj:.5f}). "
+            f"Unsupported bitsandbytes layout for {module.__class__.__name__}."
+        )
 
     return {
         "projection_before": proj_before,
@@ -144,10 +165,13 @@ def apply_ablation_to_layer(
     stats = {}
 
     for tag, weight in targets.items():
-        if _is_quantized_weight(weight):
-            module = getattr(weight, "module", None) or _find_module(model, layer_path, tag)
+        module = _find_module(model, layer_path, tag)
+        scb = _get_scb(weight, module)
+        is_quant = weight.dtype in (torch.int8, torch.uint8) or hasattr(weight, "SCB") or scb is not None
+
+        if is_quant:
             if module is None:
-                raise RuntimeError(f"Cannot locate quantized module for {layer_path}.{tag}")
+                raise RuntimeError(f"8-bit weight found but module not located: {layer_path}.{tag}")
             stats[tag] = _ablate_quantized_target(module, direction, coefficient)
             continue
 
@@ -217,20 +241,14 @@ def apply_ablation(
         coeff = coefficient * (coefficient_decay ** rank)
         layer_path = layer_paths[layer_idx]
 
-        try:
-            stats = apply_ablation_to_layer(model, layer_path, direction, coeff)
-            all_stats[layer_idx] = {
-                "layer_path": layer_path,
-                "coefficient": coeff,
-                "refusal_score": refusal_score,
-                "targets": stats,
-            }
-        except Exception as e:
-            all_stats[layer_idx] = {
-                "layer_path": layer_path,
-                "coefficient": coeff,
-                "refusal_score": refusal_score,
-                "error": str(e),
-            }
+        # NOTE: errors propagate on purpose. A silently-failed ablation would
+        # save an unmodified model and fake the whole run.
+        stats = apply_ablation_to_layer(model, layer_path, direction, coeff)
+        all_stats[layer_idx] = {
+            "layer_path": layer_path,
+            "coefficient": coeff,
+            "refusal_score": refusal_score,
+            "targets": stats,
+        }
 
     return all_stats

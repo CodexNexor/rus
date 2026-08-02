@@ -196,8 +196,10 @@ def apply_ablation_to_layer(
         sd = module.state_dict()
         cb, scb = _extract_cb_scb(module, sd)
         if cb is not None and scb is not None:  # bnb 8-bit module (either layout)
+            print(f"    [8-bit] {layer_path}.{tag}: cb={tuple(cb.shape)} scb={tuple(scb.shape)}")
             stats[tag] = _ablate_quantized_target(model, layer_path, tag, module, direction, coefficient)
             continue
+        print(f"    [fp16 ] {layer_path}.{tag}: dtype={weight.dtype}")
 
         # Plain fp16 path
         direction_dev = direction.to(weight.device, weight.dtype)

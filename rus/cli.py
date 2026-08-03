@@ -34,7 +34,10 @@ from .prompts import (
     EVAL_HARMFUL_PROMPTS as HELDOUT_HARMFUL_PROMPTS,
     EVAL_HARMLESS_PROMPTS as HELDOUT_HARMLESS_PROMPTS,
 )
-from .loader import load_model_and_tokenizer, discover_layers, get_device, get_hidden_size
+from .loader import (
+    load_model_and_tokenizer, discover_layers, get_device, get_hidden_size,
+    get_device_report, parse_max_memory_spec, release_memory,
+)
 from .collector import collect_pairwise_activations
 from .subspace import (
     compute_refusal_directions, rank_layers, select_best_layers,
@@ -58,7 +61,7 @@ LOGO = r"""[bold bright_magenta]
 ║   ██║  ██║ ╚██████╔╝ ███████║                                ║
 ║   ╚═╝  ╚═╝  ╚═════╝  ╚══════╝                                ║
 ║                                                              ║
-║   Remove Ur Refusal — Living Ablation Engine v1.2.1           ║
+║   Remove Ur Refusal — Living Ablation Engine v1.3.0           ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 [/bold bright_magenta]"""
@@ -236,6 +239,9 @@ def run_pipeline(
     strategy: str = "global",
     preserve_norm: bool = True,
     protect_harmless: bool = True,
+    device_map="auto",
+    max_memory: dict = None,
+    offload_folder: str = None,
 ):
     """
     Execute the complete RUS pipeline:
@@ -265,6 +271,9 @@ def run_pipeline(
             load_in_8bit=load_in_8bit,
             load_in_4bit=load_in_4bit,
             trust_remote_code=trust_remote_code,
+            device_map=device_map,
+            max_memory=max_memory,
+            offload_folder=offload_folder,
         )
 
     device = get_device(model)
@@ -272,6 +281,15 @@ def run_pipeline(
     hidden_size = get_hidden_size(model)
     console.print(f"  Architecture: [cyan]{num_layers} layers[/], [cyan]{hidden_size}d hidden[/]")
     console.print(f"  ✓ Model loaded on [green]{device}[/]\n")
+    report = get_device_report(model)
+    for gpu in report["gpus"]:
+        console.print(
+            f"  GPU {gpu['index']}: [cyan]{gpu['name']}[/] | "
+            f"allocated={gpu['allocated_gib']:.2f} GiB | "
+            f"free={gpu['free_gib']:.2f}/{gpu['total_gib']:.2f} GiB"
+        )
+    if report["module_placement"]:
+        console.print(f"  Module placement: [cyan]{report['module_placement']}[/]\n")
 
     # ── Step 2: Collect Activations ────────────────────
     console.print("[bold bright_magenta](2/6) Collecting activations...[/]")
@@ -292,6 +310,8 @@ def run_pipeline(
         harmful_acts, harmless_acts, num_layers,
         protect_harmless=protect_harmless,
     )
+    del harmful_acts, harmless_acts
+    release_memory()
     ranked = rank_layers(directions, LAYER_BLACKLIST_FIRST, LAYER_BLACKLIST_LAST)
 
     if selected_layers_override:
@@ -352,6 +372,7 @@ def run_pipeline(
         coefficient_decay=coefficient_decay,
         preserve_norm=preserve_norm,
     )
+    release_memory()
 
     reductions = []
     for layer_idx, stats in ablation_stats.items():
@@ -520,8 +541,29 @@ def main():
         dest="protect_harmless",
         help="Keep refusal-direction components parallel to the harmless mean",
     )
+    parser.add_argument(
+        "--device-map",
+        choices=("auto", "balanced", "balanced_low_0", "sequential"),
+        default="auto",
+        help="Accelerate model-parallel placement strategy",
+    )
+    parser.add_argument(
+        "--max-memory",
+        default=None,
+        help="Comma-separated limits, e.g. 0=12GiB,1=13GiB,cpu=24GiB",
+    )
+    parser.add_argument(
+        "--offload-folder",
+        default=None,
+        help="Optional folder for disk-offloaded weights",
+    )
 
     args = parser.parse_args()
+
+    try:
+        max_memory = parse_max_memory_spec(args.max_memory)
+    except (ValueError, TypeError):
+        parser.error("--max-memory must look like 0=12GiB,1=13GiB,cpu=24GiB")
 
     if args.load_in_8bit and args.load_in_4bit:
         parser.error("--8bit and --4bit are mutually exclusive")
@@ -572,6 +614,9 @@ def main():
         strategy=args.strategy,
         preserve_norm=args.preserve_norm,
         protect_harmless=args.protect_harmless,
+        device_map=args.device_map,
+        max_memory=max_memory,
+        offload_folder=args.offload_folder,
     )
 
 

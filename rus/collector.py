@@ -63,6 +63,7 @@ def collect_activations(
                 if (layer_idx - 1) not in all_hidden:
                     all_hidden[layer_idx - 1] = []
                 all_hidden[layer_idx - 1].append(last_hidden.cpu())
+            del outputs, hidden_states, enc, last_hidden
     finally:
         model.config.output_hidden_states = False
 

@@ -429,6 +429,73 @@ def test_apply_ablation_raises_on_failure():
         print("PASS test_apply_ablation_raises_on_failure")
 
 
+def test_dual_gpu_memory_map_and_parser():
+    """Kaggle-style limits are conservative, typed, and CLI-parseable."""
+    from rus.loader import build_balanced_max_memory, parse_max_memory_spec
+
+    old_available = torch.cuda.is_available
+    old_count = torch.cuda.device_count
+    old_properties = torch.cuda.get_device_properties
+    torch.cuda.is_available = lambda: True
+    torch.cuda.device_count = lambda: 2
+    torch.cuda.get_device_properties = lambda index: type(
+        "Props", (), {"total_memory": 15 * 1024 ** 3}
+    )()
+    try:
+        assert build_balanced_max_memory() == {0: "12GiB", 1: "13GiB"}
+    finally:
+        torch.cuda.is_available = old_available
+        torch.cuda.device_count = old_count
+        torch.cuda.get_device_properties = old_properties
+
+    assert parse_max_memory_spec("0=12GiB, 1=13GiB, cpu=24GiB") == {
+        0: "12GiB", 1: "13GiB", "cpu": "24GiB"
+    }
+    for invalid in ("0:12GiB", "gpu0=12GiB", "0=twelve", "0=12GiB,0=13GiB"):
+        try:
+            parse_max_memory_spec(invalid)
+            raise AssertionError(f"accepted invalid memory map: {invalid}")
+        except ValueError:
+            pass
+    print("PASS test_dual_gpu_memory_map_and_parser")
+
+
+def _architecture_model(attention_name, attention_projection, mlp_projection):
+    """Build an nn.Module tree matching common Transformers naming schemes."""
+    layer = torch.nn.Module()
+    attention = torch.nn.Module()
+    setattr(attention, attention_projection, torch.nn.Linear(64, 64, bias=False))
+    setattr(layer, attention_name, attention)
+    layer.mlp = torch.nn.Module()
+    setattr(layer.mlp, mlp_projection, torch.nn.Linear(128, 64, bias=False))
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([layer])
+    return model
+
+
+def test_broad_architecture_projection_targets():
+    """Resolve and edit OPT/BLOOM/GPT-NeoX-style output projections."""
+    from rus.ablate import apply_ablation_to_layer
+    from rus.loader import get_weight_targets
+
+    cases = [
+        ("self_attn", "out_proj", "fc2", {"out_proj", "fc2"}),
+        ("attention", "dense", "dense_4h_to_h", {"attention_dense", "dense_4h_to_h"}),
+        ("self_attention", "dense", "dense_4h_to_h", {"self_attention_dense", "dense_4h_to_h"}),
+    ]
+    for attention_name, attention_projection, mlp_projection, expected in cases:
+        model = _architecture_model(attention_name, attention_projection, mlp_projection)
+        targets = get_weight_targets(model, "model.layers.0")
+        assert set(targets) == expected, (attention_name, targets.keys())
+        stats = apply_ablation_to_layer(
+            model, "model.layers.0", torch.randn(64), coefficient=0.8
+        )
+        assert set(stats) == expected
+        assert all(item["reduction"] > 0.7 for item in stats.values())
+    print("PASS test_broad_architecture_projection_targets")
+
+
 if __name__ == "__main__":
     test_round_trip()
     test_projection()
@@ -440,6 +507,8 @@ if __name__ == "__main__":
     test_quantized_multi_target_routing()
     test_4bit_ablation_path()
     test_apply_ablation_raises_on_failure()
+    test_dual_gpu_memory_map_and_parser()
+    test_broad_architecture_projection_targets()
     test_exporter_shards()
     test_quantized_export_skip_modules()
     test_select_best_layers()

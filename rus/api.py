@@ -18,7 +18,9 @@ import time
 import warnings
 from typing import List, Dict, Tuple
 
-from .loader import load_model_and_tokenizer, discover_layers
+from .loader import (
+    load_model_and_tokenizer, discover_layers, get_device_report, release_memory,
+)
 from .collector import collect_pairwise_activations
 from .subspace import (
     compute_refusal_directions, rank_layers, select_best_layers,
@@ -48,7 +50,7 @@ class RusEngine:
     RUS Ablation Engine — high-level interface.
 
     Example:
-        engine = RusEngine("Qwen/Qwen2.5-3B-Instruct", load_in_8bit=True)
+        engine = RusEngine("Qwen/Qwen2.5-7B-Instruct", load_in_8bit=True)
         engine.analyze(num_prompts=48)
         engine.show_refusal()
         engine.ablate(k=5)
@@ -64,12 +66,18 @@ class RusEngine:
         load_in_4bit: bool = False,
         output_dir: str = None,
         trust_remote_code: bool = False,
+        device_map="auto",
+        max_memory: Dict = None,
+        offload_folder: str = None,
     ):
         self.model_name = model_name
         self.load_in_8bit = load_in_8bit
         self.load_in_4bit = load_in_4bit
         self.output_dir = output_dir or DEFAULT_OUTPUT_DIR
         self.trust_remote_code = trust_remote_code
+        self.device_map = device_map
+        self.max_memory = max_memory
+        self.offload_folder = offload_folder
 
         self.model = None
         self.tokenizer = None
@@ -96,9 +104,16 @@ class RusEngine:
             load_in_8bit=self.load_in_8bit,
             load_in_4bit=self.load_in_4bit,
             trust_remote_code=self.trust_remote_code,
+            device_map=self.device_map,
+            max_memory=self.max_memory,
+            offload_folder=self.offload_folder,
         )
         self.layer_paths, self.num_layers = discover_layers(self.model)
         return self
+
+    def device_report(self) -> Dict:
+        """Return GPU memory and Accelerate module-placement diagnostics."""
+        return get_device_report(self.model)
 
     def analyze(
         self, num_prompts: int = None, protect_harmless: bool = True
@@ -125,6 +140,7 @@ class RusEngine:
             harmful_acts, harmless_acts, self.num_layers,
             protect_harmless=protect_harmless,
         )
+        del harmful_acts, harmless_acts
         self._protect_harmless = protect_harmless
         self._analyzed_prompts = n
 
@@ -133,6 +149,7 @@ class RusEngine:
             LAYER_BLACKLIST_FIRST,
             LAYER_BLACKLIST_LAST,
         )
+        release_memory()
         return self
 
     def show_refusal(self, top_n: int = 16) -> List[Tuple[int, float]]:
@@ -229,6 +246,7 @@ class RusEngine:
             coefficient_decay=coefficient_decay,
             preserve_norm=preserve_norm,
         )
+        release_memory()
         return self
 
     def compare(self) -> Dict:
@@ -324,6 +342,9 @@ def ablate(
     strategy: str = "global",
     preserve_norm: bool = True,
     protect_harmless: bool = True,
+    device_map="auto",
+    max_memory: Dict = None,
+    offload_folder: str = None,
 ) -> str:
     """
     One-shot: load, analyze, ablate, compare, save.
@@ -341,6 +362,9 @@ def ablate(
         strategy: Global consensus or legacy per-layer ablation
         preserve_norm: Restore projected weight-vector magnitudes
         protect_harmless: Orthogonalize estimates against harmless mean activations
+        device_map: Accelerate placement strategy or explicit module map
+        max_memory: Per-device memory limits such as ``{0: '12GiB', 1: '13GiB'}``
+        offload_folder: Optional disk-offload directory
 
     Returns:
         Path to the saved abliterated model.
@@ -355,6 +379,9 @@ def ablate(
         load_in_4bit=load_in_4bit,
         output_dir=output_dir,
         trust_remote_code=trust_remote_code,
+        device_map=device_map,
+        max_memory=max_memory,
+        offload_folder=offload_folder,
     )
 
     engine.analyze(num_prompts=num_prompts, protect_harmless=protect_harmless)

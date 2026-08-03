@@ -17,6 +17,13 @@ TARGET_SUFFIXES = {
     "down_proj": "mlp.down_proj",
     "c_proj_mlp": "mlp.c_proj",
     "fc2": "mlp.fc2",
+    "out_proj": "self_attn.out_proj",
+    "attn_out_proj": "attn.out_proj",
+    "attention_dense": "attention.dense",
+    "self_attention_dense": "self_attention.dense",
+    "dense_4h_to_h": "mlp.dense_4h_to_h",
+    "fc_out": "mlp.fc_out",
+    "feed_forward_w2": "feed_forward.w2",
 }
 
 

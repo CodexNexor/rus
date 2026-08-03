@@ -200,6 +200,30 @@ def test_exporter_shards():
     print("PASS test_exporter_shards")
 
 
+def test_quantized_export_skip_modules():
+    from rus.exporter import _configure_quantization_skip_modules
+    quant_config = type("QuantConfig", (), {"llm_int8_skip_modules": None})()
+    model = type("Model", (), {"config": type("Config", (), {
+        "quantization_config": quant_config
+    })()})()
+    stats = {
+        7: {
+            "layer_path": "model.layers.7",
+            "targets": {
+                "o_proj": {"quantized": True},
+                "down_proj": {"quantized": True},
+            },
+        }
+    }
+    names = _configure_quantization_skip_modules(model, stats)
+    assert names == [
+        "model.layers.7.mlp.down_proj",
+        "model.layers.7.self_attn.o_proj",
+    ]
+    assert quant_config.llm_int8_skip_modules == names
+    print("PASS test_quantized_export_skip_modules")
+
+
 def test_select_best_layers():
     """Low absolute scores (normal with many prompts) must still yield top-k."""
     from rus.subspace import select_best_layers
@@ -417,6 +441,7 @@ if __name__ == "__main__":
     test_4bit_ablation_path()
     test_apply_ablation_raises_on_failure()
     test_exporter_shards()
+    test_quantized_export_skip_modules()
     test_select_best_layers()
     test_mean_difference_direction()
     test_consensus_direction_sign_alignment()

@@ -12,6 +12,8 @@ from datetime import datetime
 
 import torch
 
+from .ablate import TARGET_SUFFIXES
+
 try:
     import safetensors.torch as st
     _HAS_SAFETENSORS = True
@@ -20,6 +22,39 @@ except ImportError:
     _HAS_SAFETENSORS = False
 
 MAX_SHARD_SIZE = 5 * 1024 ** 3  # 5GB per shard, same as transformers default
+
+
+def _configure_quantization_skip_modules(model, ablation_stats: dict) -> list:
+    """Keep fp16 replacement modules unquantized when a mixed model reloads.
+
+    bitsandbytes replaces ordinary Linear modules during ``from_pretrained``.
+    Ablated quantized targets were intentionally replaced by fp16 Linear, so
+    they must be named in the serialized quantizer skip list or they reload as
+    incomplete Linear8bitLt modules without CB/SCB state.
+    """
+    module_names = []
+    for layer in ablation_stats.values():
+        layer_path = layer.get("layer_path")
+        if not layer_path:
+            continue
+        for tag, target_stats in layer.get("targets", {}).items():
+            if not isinstance(target_stats, dict) or not target_stats.get("quantized"):
+                continue
+            suffix = TARGET_SUFFIXES.get(tag)
+            if suffix:
+                module_names.append(f"{layer_path}.{suffix}")
+
+    quant_config = getattr(getattr(model, "config", None), "quantization_config", None)
+    if not module_names or quant_config is None:
+        return sorted(set(module_names))
+
+    if isinstance(quant_config, dict):
+        existing = quant_config.get("llm_int8_skip_modules") or []
+        quant_config["llm_int8_skip_modules"] = sorted(set(existing) | set(module_names))
+    else:
+        existing = getattr(quant_config, "llm_int8_skip_modules", None) or []
+        quant_config.llm_int8_skip_modules = sorted(set(existing) | set(module_names))
+    return sorted(set(module_names))
 
 
 def _dedupe_tied(state_dict: dict) -> dict:
@@ -117,6 +152,10 @@ def export_model(
     if not ablation_stats:
         raise RuntimeError("Refusing to export a model with no recorded ablation")
 
+    quantization_skip_modules = _configure_quantization_skip_modules(
+        model, ablation_stats
+    )
+
     # Transformers owns the serialization contract for quantized checkpoints.
     # Modern bitsandbytes checkpoints include quantization state that a raw
     # state_dict writer cannot safely reconstruct.
@@ -129,13 +168,14 @@ def export_model(
 
     metadata = {
         "tool": "RUS — Remove Ur Refusal",
-        "version": "1.2.0",
+        "version": "1.2.1",
         "original_model": model_name,
         "exported_at": datetime.now().isoformat(),
         "quantized": any(
             p.dtype in (torch.int8, torch.uint8) for p in model.parameters()
         ) if hasattr(model, "parameters") else False,
         "method": method_metadata or {},
+        "quantization_skip_modules": quantization_skip_modules,
         "ablation_stats": {
             str(k): {
                 "layer_path": v.get("layer_path", ""),

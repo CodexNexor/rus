@@ -41,8 +41,9 @@ all compatible residual-writing output projections with norm preservation. See
 Open [`rus_kaggle_dual_t4_7b.ipynb`](rus_kaggle_dual_t4_7b.ipynb) in a Kaggle
 GPU notebook and select the **GPU T4 x2** accelerator. The notebook loads the
 7B checkpoint in 8-bit mode, balances transformer modules over both GPUs,
-prints per-GPU memory use, verifies both devices are active, runs the pipeline,
-then reloads the exported checkpoint and performs a real forward pass.
+prints per-GPU memory use, verifies placement, runs the pipeline, then reloads
+the exported checkpoint and performs a real forward pass. If Kaggle assigns
+only one GPU, the notebook automatically uses a single-GPU 7B fallback.
 
 The equivalent CLI settings are:
 

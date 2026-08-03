@@ -2,10 +2,13 @@
 RUS Model Loader — downloads from HuggingFace, discovers architecture, returns hooks-ready model.
 """
 
-import logging
-import torch
 import gc
-from typing import Tuple, List, Dict
+import logging
+import re
+from collections import Counter
+from typing import Tuple, List, Dict, Optional, Union
+
+import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -25,9 +28,12 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 def load_model_and_tokenizer(
     model_name: str,
     dtype: torch.dtype = DEFAULT_DTYPE,
-    device_map: str = DEFAULT_DEVICE_MAP,
+    device_map: Union[str, Dict] = DEFAULT_DEVICE_MAP,
     load_in_8bit: bool = False,
     load_in_4bit: bool = False,
+    trust_remote_code: bool = TRUST_REMOTE_CODE,
+    max_memory: Optional[Dict] = None,
+    offload_folder: Optional[str] = None,
 ) -> Tuple[PreTrainedModel, PreTrainedTokenizer]:
     """
     Download (if needed) and load a HuggingFace causal LM + its tokenizer.
@@ -36,9 +42,19 @@ def load_model_and_tokenizer(
     gc.collect()
     torch.cuda.empty_cache()
 
+    if load_in_8bit and load_in_4bit:
+        raise ValueError("Choose either 8-bit or 4-bit loading, not both.")
+
+    # balanced_low_0 reserves GPU 0 for input/output tensors and generation,
+    # while still distributing transformer blocks across every visible GPU.
+    if device_map == "auto" and torch.cuda.device_count() > 1:
+        device_map = "balanced_low_0"
+    if max_memory is None and torch.cuda.device_count() > 1:
+        max_memory = build_balanced_max_memory()
+
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
-        trust_remote_code=TRUST_REMOTE_CODE,
+        trust_remote_code=trust_remote_code,
     )
 
     if tokenizer.pad_token is None:
@@ -46,8 +62,14 @@ def load_model_and_tokenizer(
 
     kwargs = {
         "device_map": device_map,
-        "trust_remote_code": TRUST_REMOTE_CODE,
+        "trust_remote_code": trust_remote_code,
+        "low_cpu_mem_usage": True,
     }
+    if max_memory is not None:
+        kwargs["max_memory"] = max_memory
+    if offload_folder is not None:
+        kwargs["offload_folder"] = offload_folder
+        kwargs["offload_state_dict"] = True
 
     if load_in_4bit:
         kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -60,7 +82,6 @@ def load_model_and_tokenizer(
     elif load_in_8bit:
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_8bit=True,
-            bnb_8bit_compute_dtype=torch.float16,
         )
         # MUST pass torch_dtype=float16: without it transformers uses the
         # config's bf16 and bitsandbytes re-casts to fp16 on every matmul,
@@ -75,6 +96,90 @@ def load_model_and_tokenizer(
     model.eval()
 
     return model, tokenizer
+
+
+def build_balanced_max_memory(
+    reserve_gpu0_gib: float = 2.5,
+    reserve_other_gib: float = 1.5,
+    cpu_gib: Optional[int] = None,
+) -> Dict:
+    """Build a conservative Accelerate max-memory map for visible GPUs."""
+    if not torch.cuda.is_available():
+        return {"cpu": f"{cpu_gib}GiB"} if cpu_gib else {}
+    result = {}
+    gib = 1024 ** 3
+    for index in range(torch.cuda.device_count()):
+        total_gib = torch.cuda.get_device_properties(index).total_memory / gib
+        reserve = reserve_gpu0_gib if index == 0 else reserve_other_gib
+        usable = max(1, int(total_gib - reserve))
+        result[index] = f"{usable}GiB"
+    if cpu_gib:
+        result["cpu"] = f"{cpu_gib}GiB"
+    return result
+
+
+def parse_max_memory_spec(spec: Optional[str]) -> Optional[Dict]:
+    """Parse an Accelerate memory map such as ``0=12GiB,1=13GiB,cpu=24GiB``."""
+    if spec is None or not spec.strip():
+        return None
+    result = {}
+    value_pattern = re.compile(r"^\d+(?:\.\d+)?(?:KiB|MiB|GiB|KB|MB|GB)$", re.IGNORECASE)
+    for raw_entry in spec.split(","):
+        entry = raw_entry.strip()
+        if "=" not in entry:
+            raise ValueError("each entry must use device=value")
+        raw_key, raw_value = (part.strip() for part in entry.split("=", 1))
+        if raw_key.isdigit():
+            key = int(raw_key)
+        elif raw_key == "cpu":
+            key = raw_key
+        else:
+            raise ValueError(f"unsupported device key: {raw_key!r}")
+        if not value_pattern.fullmatch(raw_value):
+            raise ValueError(f"invalid memory value: {raw_value!r}")
+        if key in result:
+            raise ValueError(f"duplicate device key: {raw_key!r}")
+        result[key] = raw_value
+    return result
+
+
+def get_device_report(model=None) -> Dict:
+    """Return deterministic placement and CUDA-memory diagnostics."""
+    gpus = []
+    gib = 1024 ** 3
+    for index in range(torch.cuda.device_count()):
+        free, total = torch.cuda.mem_get_info(index)
+        gpus.append({
+            "index": index,
+            "name": torch.cuda.get_device_name(index),
+            "allocated_gib": round(torch.cuda.memory_allocated(index) / gib, 3),
+            "reserved_gib": round(torch.cuda.memory_reserved(index) / gib, 3),
+            "free_gib": round(free / gib, 3),
+            "total_gib": round(total / gib, 3),
+        })
+    placement = Counter()
+    cuda_devices = set()
+    if model is not None:
+        for device in getattr(model, "hf_device_map", {}).values():
+            placement[str(device)] += 1
+            device_text = str(device)
+            if isinstance(device, int):
+                cuda_devices.add(device)
+            elif device_text.startswith("cuda:") and device_text[5:].isdigit():
+                cuda_devices.add(int(device_text[5:]))
+    return {
+        "gpu_count": len(gpus),
+        "gpus": gpus,
+        "module_placement": dict(placement),
+        "active_cuda_devices": sorted(cuda_devices),
+    }
+
+
+def release_memory() -> None:
+    """Release unreachable Python objects and unused CUDA allocator blocks."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def discover_layers(model: PreTrainedModel) -> Tuple[List[str], int]:
@@ -146,6 +251,20 @@ def get_weight_targets(model: PreTrainedModel, layer_path: str) -> Dict[str, tor
         ("mlp.c_proj", "c_proj_mlp"),
         ("mlp.fc2.weight", "fc2"),
         ("mlp.fc2", "fc2"),
+        ("self_attn.out_proj.weight", "out_proj"),
+        ("self_attn.out_proj", "out_proj"),
+        ("attn.out_proj.weight", "attn_out_proj"),
+        ("attn.out_proj", "attn_out_proj"),
+        ("attention.dense.weight", "attention_dense"),
+        ("attention.dense", "attention_dense"),
+        ("self_attention.dense.weight", "self_attention_dense"),
+        ("self_attention.dense", "self_attention_dense"),
+        ("mlp.dense_4h_to_h.weight", "dense_4h_to_h"),
+        ("mlp.dense_4h_to_h", "dense_4h_to_h"),
+        ("mlp.fc_out.weight", "fc_out"),
+        ("mlp.fc_out", "fc_out"),
+        ("feed_forward.w2.weight", "feed_forward_w2"),
+        ("feed_forward.w2", "feed_forward_w2"),
     ]
 
     for attr_path, tag in weight_candidates:
@@ -155,7 +274,9 @@ def get_weight_targets(model: PreTrainedModel, layer_path: str) -> Dict[str, tor
                 obj = getattr(obj, part)
             if isinstance(obj, torch.Tensor) or hasattr(obj, "weight"):
                 w = obj.weight if hasattr(obj, "weight") else obj
-                if w.dim() == 2 and w.shape[0] >= 64 and w.shape[1] >= 64:
+                quant_state = getattr(w, "quant_state", None)
+                logical_shape = getattr(quant_state, "shape", w.shape)
+                if len(logical_shape) == 2 and logical_shape[0] >= 64 and logical_shape[1] >= 64:
                     targets[tag] = w
         except (AttributeError, TypeError):
             continue

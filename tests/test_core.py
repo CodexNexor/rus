@@ -5,8 +5,8 @@ and the sharded exporter. Run: python tests/test_core.py
 
 import os
 import sys
-import shutil
-import json
+import tempfile
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -17,7 +17,7 @@ from rus.ablate import (
     project_direction_from_weight,
     _block_size,
 )
-from rus.exporter import _shard_state_dict, _save_shards
+from rus.exporter import _save_shards
 
 
 class _Int8Param(torch.Tensor):
@@ -45,10 +45,16 @@ class FakeBnbModule:
         self.bias = None
         if layout == "param_attr":
             self._weight_param = _Int8Param(cb, scb)
+        elif layout == "module_state":
+            self.state = type("State", (), {"CB": cb, "SCB": scb})()
 
     def state_dict(self):
         if self._layout == "param_attr":
             return {"weight": self._weight_param}
+        if self._layout == "module_state":
+            return {"weight": self._cb}
+        if self._layout == "scb_key":
+            return {"weight": self._cb, "SCB": self._scb}
         return {"weight": self._cb, "weight.SCB": self._scb}
 
     @property
@@ -88,6 +94,46 @@ def test_projection():
     after = (vn @ wm).abs().mean().item()
     assert after < before * 0.3, f"projection not removed: {before} -> {after}"
     print(f"PASS test_projection ({before:.4f} -> {after:.4f})")
+
+
+def test_transposed_projection():
+    """Transformers Conv1D stores weights as (input, output)."""
+    torch.manual_seed(11)
+    w = torch.randn(512, 256)
+    v = torch.randn(256)
+    wm = project_direction_from_weight(w, v, coefficient=1.0, output_axis=1)
+    assert (wm @ (v / v.norm())).abs().mean() < 1e-5
+    print("PASS test_transposed_projection")
+
+
+def test_norm_preserving_projection():
+    torch.manual_seed(13)
+    w = torch.randn(256, 128)
+    v = torch.randn(256)
+    before_norms = w.norm(dim=0)
+    wm = project_direction_from_weight(w, v, coefficient=1.0, preserve_norm=True)
+    assert torch.allclose(wm.norm(dim=0), before_norms, rtol=1e-5, atol=1e-5)
+    assert ((v / v.norm()) @ wm).abs().max() < 1e-5
+    print("PASS test_norm_preserving_projection")
+
+
+def test_chunked_inplace_projection():
+    """The low-memory path reuses storage and matches the regular projection."""
+    torch.manual_seed(14)
+    weight = torch.randn(256, 384, dtype=torch.float16)
+    direction = torch.randn(256, dtype=torch.float16)
+    expected = project_direction_from_weight(
+        weight, direction, coefficient=0.8, preserve_norm=True, chunk_size=31
+    )
+    candidate = weight.clone()
+    pointer = candidate.data_ptr()
+    actual = project_direction_from_weight(
+        candidate, direction, coefficient=0.8, preserve_norm=True,
+        inplace=True, chunk_size=31,
+    )
+    assert actual.data_ptr() == pointer
+    assert torch.allclose(actual, expected, rtol=2e-3, atol=2e-3)
+    print("PASS test_chunked_inplace_projection")
 
 
 class _Indexable:
@@ -147,33 +193,54 @@ def test_quantized_ablation_path():
     print(f"PASS test_quantized_ablation_path ({before:.4f} -> {after:.4f})")
 
 
-def test_exporter_shards(tmp="/tmp/rus_export_test"):
-    shutil.rmtree(tmp, ignore_errors=True)
-    os.makedirs(tmp)
-    t = torch.randn(100, 100)
-    state = {
-        "a": t,
-        "b": t[:],  # shared storage — must be deduplicated
-        "c.weight": torch.randn(10, 10),
-    }
-    from rus.exporter import _dedupe_tied
-    deduped = _dedupe_tied(state)
-    assert "b" not in deduped or "a" not in deduped, deduped.keys()
-    with torch.no_grad():
-        weight_map = _save_shards(deduped, tmp)
-    files = sorted(os.listdir(tmp))
-    assert any(f.endswith(".safetensors") for f in files), files
-    if len(files) > 1:
-        assert "model.safetensors.index.json" in files
-    # reload and compare
-    import safetensors.torch as st
-    keys = []
-    for f in files:
-        if f.endswith(".safetensors"):
-            keys += list(st.load_file(os.path.join(tmp, f)).keys())
-    assert sorted(keys) == sorted(deduped.keys()), (sorted(keys), sorted(deduped))
-    shutil.rmtree(tmp, ignore_errors=True)
+def test_exporter_shards():
+    with tempfile.TemporaryDirectory() as tmp:
+        t = torch.randn(100, 100)
+        state = {
+            "a": t,
+            "b": t[:],  # shared storage — must be deduplicated
+            "c.weight": torch.randn(10, 10),
+        }
+        from rus.exporter import _dedupe_tied
+        deduped = _dedupe_tied(state)
+        assert "b" not in deduped or "a" not in deduped, deduped.keys()
+        with torch.no_grad():
+            _save_shards(deduped, tmp)
+        files = sorted(os.listdir(tmp))
+        assert any(f.endswith(".safetensors") for f in files), files
+        if len(files) > 1:
+            assert "model.safetensors.index.json" in files
+        import safetensors.torch as st
+        keys = []
+        for f in files:
+            if f.endswith(".safetensors"):
+                keys += list(st.load_file(os.path.join(tmp, f)).keys())
+        assert sorted(keys) == sorted(deduped.keys()), (sorted(keys), sorted(deduped))
     print("PASS test_exporter_shards")
+
+
+def test_quantized_export_skip_modules():
+    from rus.exporter import _configure_quantization_skip_modules
+    quant_config = type("QuantConfig", (), {"llm_int8_skip_modules": None})()
+    model = type("Model", (), {"config": type("Config", (), {
+        "quantization_config": quant_config
+    })()})()
+    stats = {
+        7: {
+            "layer_path": "model.layers.7",
+            "targets": {
+                "o_proj": {"quantized": True},
+                "down_proj": {"quantized": True},
+            },
+        }
+    }
+    names = _configure_quantization_skip_modules(model, stats)
+    assert names == [
+        "model.layers.7.mlp.down_proj",
+        "model.layers.7.self_attn.o_proj",
+    ]
+    assert quant_config.llm_int8_skip_modules == names
+    print("PASS test_quantized_export_skip_modules")
 
 
 def test_select_best_layers():
@@ -187,6 +254,66 @@ def test_select_best_layers():
     print("PASS test_select_best_layers")
 
 
+def test_mean_difference_direction():
+    from rus.subspace import compute_refusal_directions
+    torch.manual_seed(12)
+    harmless = torch.randn(32, 16) * 0.2
+    harmful = harmless + torch.tensor([2.0] + [0.0] * 15)
+    result = compute_refusal_directions(
+        {0: [harmful]}, {0: [harmless]}, 1, protect_harmless=False
+    )[0]
+    expected = torch.tensor([1.0] + [0.0] * 15)
+    assert torch.dot(result["direction"], expected) > 0.99
+    assert 0.0 <= result["score"] <= 1.0
+    print("PASS test_mean_difference_direction")
+
+
+def test_consensus_direction_sign_alignment():
+    from rus.subspace import build_consensus_direction
+    base = torch.tensor([1.0, 0.0, 0.0])
+    ranked = [(3, 0.9, base), (4, 0.8, -base), (5, 0.7, base)]
+    consensus, layers = build_consensus_direction(ranked, 3)
+    assert torch.dot(consensus, base) > 0.999
+    assert layers == [3, 4, 5]
+    print("PASS test_consensus_direction_sign_alignment")
+
+
+def test_comparison_reports_kl_drift():
+    from rus.evaluator import compare_suites
+    before_lp = torch.log_softmax(torch.tensor([[3.0, 1.0, 0.0]]), dim=-1)
+    after_lp = torch.log_softmax(torch.tensor([[2.0, 1.5, 0.0]]), dim=-1)
+    common = {"refusal_rate": 1.0, "compliance": 0.0, "quality": 1.0, "samples": []}
+    result = compare_suites(
+        {**common, "harmless_next_token_logprobs": before_lp},
+        {**common, "harmless_next_token_logprobs": after_lp},
+    )
+    assert result["harmless_kl_divergence"] > 0
+    print("PASS test_comparison_reports_kl_drift")
+
+
+def test_refusal_detector_avoids_generic_safety_words():
+    from rus.evaluator import detect_refusal
+    assert not detect_refusal("This chemical is dangerous, so wear gloves and goggles.")
+    assert detect_refusal("I cannot assist with that request.")
+    print("PASS test_refusal_detector_avoids_generic_safety_words")
+
+
+def test_layer_table_is_ranked_and_shows_selection():
+    from rich.console import Console
+    from rus.cli import build_layer_table
+    directions = {
+        i: {"score": i / 32.0, "direction": torch.randn(8)} for i in range(32)
+    }
+    selected = [(27, directions[27]["score"], directions[27]["direction"])]
+    table = build_layer_table(directions, selected, top_n=5)
+    console = Console(record=True, width=100)
+    console.print(table)
+    rendered = console.export_text()
+    assert "27" in rendered and "SELECTED" in rendered
+    assert "│     2 │" not in rendered  # numeric-order layer 2 must not displace top ranks
+    print("PASS test_layer_table_is_ranked_and_shows_selection")
+
+
 def test_quantized_scb_layouts():
     """Works regardless of where bnb stashes CB/SCB (state_dict key or param attr)."""
     from rus.ablate import _ablate_quantized_target
@@ -196,13 +323,102 @@ def test_quantized_scb_layouts():
     cb, scb = quantize_absmax(w, 64)
     v = torch.randn(256).half()
 
-    for layout in ("state_dict", "param_attr"):
+    for layout in ("state_dict", "scb_key", "param_attr", "module_state"):
         mod = FakeBnbModule(cb, scb, layout=layout)
         model = _fake_model_with_module(mod)
         stats = _ablate_quantized_target(model, "model.layers.0", "o_proj", mod, v, coefficient=0.8)
         assert stats["reduction"] > 0.7, stats
         assert isinstance(model.model.layers._items[0].self_attn.o_proj, torch.nn.Linear)
     print("PASS test_quantized_scb_layouts")
+
+
+def test_packed_weight_never_uses_plain_path():
+    """Unknown quantization layouts fail clearly before int8 matmul."""
+    mod = FakeBnbModule(torch.zeros(256, 256, dtype=torch.int8), None)
+    model = _fake_model_with_module(mod)
+    from rus.ablate import apply_ablation_to_layer
+    try:
+        apply_ablation_to_layer(model, "model.layers.0", torch.randn(256), 0.8)
+        raise AssertionError("packed int8 weight should have been rejected")
+    except RuntimeError as exc:
+        assert "Packed quantized weight" in str(exc)
+    print("PASS test_packed_weight_never_uses_plain_path")
+
+
+def test_quantized_multi_target_routing():
+    """o_proj and down_proj must each use their own quantized module."""
+    torch.manual_seed(4)
+    w1 = (torch.randn(256, 256) * 0.02).half()
+    w2 = (torch.randn(256, 512) * 0.02).half()
+    o_proj = FakeBnbModule(*quantize_absmax(w1, 64))
+    down_proj = FakeBnbModule(*quantize_absmax(w2, 64))
+    model = _fake_model_with_module(o_proj)
+    model.model.layers._items[0].mlp.down_proj = down_proj
+    from rus.ablate import apply_ablation_to_layer
+    stats = apply_ablation_to_layer(model, "model.layers.0", torch.randn(256), 0.4)
+    layer = model.model.layers._items[0]
+    assert isinstance(layer.self_attn.o_proj, torch.nn.Linear)
+    assert isinstance(layer.mlp.down_proj, torch.nn.Linear)
+    assert set(stats) == {"o_proj", "down_proj"}
+    print("PASS test_quantized_multi_target_routing")
+
+
+def test_4bit_ablation_path():
+    """NF4 path uses quant_state and replaces the target with fp16 Linear."""
+    torch.manual_seed(5)
+    fp = (torch.randn(256, 256) * 0.02).half()
+
+    class Fake4Bit:
+        bias = None
+        def __init__(self):
+            self.weight = torch.zeros_like(fp, dtype=torch.uint8)
+            self.weight.quant_state = object()
+        def state_dict(self):
+            return {"weight": self.weight}
+
+    functional = types.ModuleType("bitsandbytes.functional")
+    functional.dequantize_4bit = lambda data, quant_state: fp.clone()
+    package = types.ModuleType("bitsandbytes")
+    package.functional = functional
+    old_package = sys.modules.get("bitsandbytes")
+    old_functional = sys.modules.get("bitsandbytes.functional")
+    sys.modules["bitsandbytes"] = package
+    sys.modules["bitsandbytes.functional"] = functional
+    try:
+        model = _fake_model_with_module(Fake4Bit())
+        from rus.ablate import apply_ablation_to_layer
+        stats = apply_ablation_to_layer(model, "model.layers.0", torch.randn(256), 0.8)
+        assert stats["o_proj"]["quantization_bits"] == 4
+        assert isinstance(model.model.layers._items[0].self_attn.o_proj, torch.nn.Linear)
+    finally:
+        if old_package is None:
+            sys.modules.pop("bitsandbytes", None)
+        else:
+            sys.modules["bitsandbytes"] = old_package
+        if old_functional is None:
+            sys.modules.pop("bitsandbytes.functional", None)
+        else:
+            sys.modules["bitsandbytes.functional"] = old_functional
+    print("PASS test_4bit_ablation_path")
+
+
+def test_tracker_upsert():
+    import rus.tracker as tracker
+    old_path = tracker.DB_PATH
+    with tempfile.TemporaryDirectory() as tmp:
+        tracker.DB_PATH = os.path.join(tmp, "experience.db")
+        try:
+            for _ in range(2):
+                tracker.log_run(
+                    "Qwen/test", 8, 1, 0.8, [2], [0.8], {}, None, 1.0,
+                    {2: 0.7},
+                    {2: {"coefficient": 0.8, "targets": {"o_proj": {"reduction": 0.8}}}},
+                )
+            insight = tracker.get_insights("qwen")
+            assert insight["num_runs"] == 2, insight
+        finally:
+            tracker.DB_PATH = old_path
+    print("PASS test_tracker_upsert")
 
 
 def test_apply_ablation_raises_on_failure():
@@ -232,12 +448,129 @@ def test_apply_ablation_raises_on_failure():
         print("PASS test_apply_ablation_raises_on_failure")
 
 
+def test_dual_gpu_memory_map_and_parser():
+    """Kaggle-style limits are conservative, typed, and CLI-parseable."""
+    from rus.loader import build_balanced_max_memory, parse_max_memory_spec
+
+    old_available = torch.cuda.is_available
+    old_count = torch.cuda.device_count
+    old_properties = torch.cuda.get_device_properties
+    torch.cuda.is_available = lambda: True
+    torch.cuda.device_count = lambda: 2
+    torch.cuda.get_device_properties = lambda index: type(
+        "Props", (), {"total_memory": 15 * 1024 ** 3}
+    )()
+    try:
+        assert build_balanced_max_memory() == {0: "12GiB", 1: "13GiB"}
+    finally:
+        torch.cuda.is_available = old_available
+        torch.cuda.device_count = old_count
+        torch.cuda.get_device_properties = old_properties
+
+    assert parse_max_memory_spec("0=12GiB, 1=13GiB, cpu=24GiB") == {
+        0: "12GiB", 1: "13GiB", "cpu": "24GiB"
+    }
+    for invalid in ("0:12GiB", "gpu0=12GiB", "0=twelve", "0=12GiB,0=13GiB"):
+        try:
+            parse_max_memory_spec(invalid)
+            raise AssertionError(f"accepted invalid memory map: {invalid}")
+        except ValueError:
+            pass
+    print("PASS test_dual_gpu_memory_map_and_parser")
+
+
+def test_global_top_k_limits_destinations():
+    """Consensus mode for large models edits only the requested destinations."""
+    import rus.api as api
+
+    engine = api.RusEngine("fake/model")
+    engine.model = object()
+    engine.tokenizer = object()
+    engine.layer_paths = [f"model.layers.{index}" for index in range(8)]
+    engine.directions = {
+        index: {"score": 1.0 - index / 10, "direction": torch.randn(16)}
+        for index in range(8)
+    }
+    engine.ranked_layers = [
+        (index, info["score"], info["direction"])
+        for index, info in engine.directions.items()
+    ]
+    engine.baseline_results = {"already": "captured"}
+    captured = {}
+    old_apply = api.apply_ablation
+    api.apply_ablation = lambda model, selected, paths, **kwargs: captured.setdefault(
+        "selected", selected
+    ) or {}
+    try:
+        engine.ablate(k=3, strategy="global_top_k", capture_baseline=False)
+    finally:
+        api.apply_ablation = old_apply
+    assert len(engine.selected_layers) == 3
+    assert len(captured["selected"]) == 3
+    assert engine.source_layers == [0, 1, 2]
+    directions = [item[2] for item in engine.selected_layers]
+    assert all(torch.equal(directions[0], item) for item in directions[1:])
+    print("PASS test_global_top_k_limits_destinations")
+
+
+def _architecture_model(attention_name, attention_projection, mlp_projection):
+    """Build an nn.Module tree matching common Transformers naming schemes."""
+    layer = torch.nn.Module()
+    attention = torch.nn.Module()
+    setattr(attention, attention_projection, torch.nn.Linear(64, 64, bias=False))
+    setattr(layer, attention_name, attention)
+    layer.mlp = torch.nn.Module()
+    setattr(layer.mlp, mlp_projection, torch.nn.Linear(128, 64, bias=False))
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([layer])
+    return model
+
+
+def test_broad_architecture_projection_targets():
+    """Resolve and edit OPT/BLOOM/GPT-NeoX-style output projections."""
+    from rus.ablate import apply_ablation_to_layer
+    from rus.loader import get_weight_targets
+
+    cases = [
+        ("self_attn", "out_proj", "fc2", {"out_proj", "fc2"}),
+        ("attention", "dense", "dense_4h_to_h", {"attention_dense", "dense_4h_to_h"}),
+        ("self_attention", "dense", "dense_4h_to_h", {"self_attention_dense", "dense_4h_to_h"}),
+    ]
+    for attention_name, attention_projection, mlp_projection, expected in cases:
+        model = _architecture_model(attention_name, attention_projection, mlp_projection)
+        targets = get_weight_targets(model, "model.layers.0")
+        assert set(targets) == expected, (attention_name, targets.keys())
+        stats = apply_ablation_to_layer(
+            model, "model.layers.0", torch.randn(64), coefficient=0.8
+        )
+        assert set(stats) == expected
+        assert all(item["reduction"] > 0.7 for item in stats.values())
+    print("PASS test_broad_architecture_projection_targets")
+
+
 if __name__ == "__main__":
     test_round_trip()
     test_projection()
+    test_transposed_projection()
+    test_norm_preserving_projection()
+    test_chunked_inplace_projection()
     test_quantized_ablation_path()
     test_quantized_scb_layouts()
+    test_packed_weight_never_uses_plain_path()
+    test_quantized_multi_target_routing()
+    test_4bit_ablation_path()
     test_apply_ablation_raises_on_failure()
+    test_dual_gpu_memory_map_and_parser()
+    test_global_top_k_limits_destinations()
+    test_broad_architecture_projection_targets()
     test_exporter_shards()
+    test_quantized_export_skip_modules()
     test_select_best_layers()
+    test_mean_difference_direction()
+    test_consensus_direction_sign_alignment()
+    test_comparison_reports_kl_drift()
+    test_refusal_detector_avoids_generic_safety_words()
+    test_layer_table_is_ranked_and_shows_selection()
+    test_tracker_upsert()
     print("\nAll tests passed ✓")

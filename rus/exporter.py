@@ -1,11 +1,9 @@
 """
 RUS Exporter — saves the abliterated model and tokenizer to disk.
 
-Saves via the model's state_dict (sharded safetensors + index) instead of
-save_pretrained. This is required because save_pretrained refuses 8-bit
-quantized (bitsandbytes) models, and it works identically for fp16 models.
-The resulting checkpoint is a standard transformers multi-shard safetensors
-folder loadable with from_pretrained(..., load_in_8bit=True/False).
+Uses Transformers' quantizer-aware ``save_pretrained`` implementation. Manual
+serialization of bitsandbytes internals produces checkpoints whose config and
+weight representation can disagree on reload.
 """
 
 import os
@@ -13,6 +11,8 @@ import json
 from datetime import datetime
 
 import torch
+
+from .ablate import TARGET_SUFFIXES
 
 try:
     import safetensors.torch as st
@@ -22,6 +22,39 @@ except ImportError:
     _HAS_SAFETENSORS = False
 
 MAX_SHARD_SIZE = 5 * 1024 ** 3  # 5GB per shard, same as transformers default
+
+
+def _configure_quantization_skip_modules(model, ablation_stats: dict) -> list:
+    """Keep fp16 replacement modules unquantized when a mixed model reloads.
+
+    bitsandbytes replaces ordinary Linear modules during ``from_pretrained``.
+    Ablated quantized targets were intentionally replaced by fp16 Linear, so
+    they must be named in the serialized quantizer skip list or they reload as
+    incomplete Linear8bitLt modules without CB/SCB state.
+    """
+    module_names = []
+    for layer in ablation_stats.values():
+        layer_path = layer.get("layer_path")
+        if not layer_path:
+            continue
+        for tag, target_stats in layer.get("targets", {}).items():
+            if not isinstance(target_stats, dict) or not target_stats.get("quantized"):
+                continue
+            suffix = TARGET_SUFFIXES.get(tag)
+            if suffix:
+                module_names.append(f"{layer_path}.{suffix}")
+
+    quant_config = getattr(getattr(model, "config", None), "quantization_config", None)
+    if not module_names or quant_config is None:
+        return sorted(set(module_names))
+
+    if isinstance(quant_config, dict):
+        existing = quant_config.get("llm_int8_skip_modules") or []
+        quant_config["llm_int8_skip_modules"] = sorted(set(existing) | set(module_names))
+    else:
+        existing = getattr(quant_config, "llm_int8_skip_modules", None) or []
+        quant_config.llm_int8_skip_modules = sorted(set(existing) | set(module_names))
+    return sorted(set(module_names))
 
 
 def _dedupe_tied(state_dict: dict) -> dict:
@@ -98,6 +131,7 @@ def export_model(
     model_name: str,
     ablation_stats: dict,
     comparison_results: dict,
+    method_metadata: dict = None,
 ):
     """
     Save the modified model, tokenizer, and metadata to disk.
@@ -115,25 +149,39 @@ def export_model(
 
     os.makedirs(export_path, exist_ok=True)
 
-    model.config.save_pretrained(export_path)
-    tokenizer.save_pretrained(export_path)
+    if not ablation_stats:
+        raise RuntimeError("Refusing to export a model with no recorded ablation")
 
-    # state_dict() returns CPU copies — safe for both fp16 and 8-bit models
-    _save_shards(_dedupe_tied(model.state_dict()), export_path)
+    quantization_skip_modules = _configure_quantization_skip_modules(
+        model, ablation_stats
+    )
+
+    # Transformers owns the serialization contract for quantized checkpoints.
+    # Modern bitsandbytes checkpoints include quantization state that a raw
+    # state_dict writer cannot safely reconstruct.
+    model.save_pretrained(
+        export_path,
+        safe_serialization=True,
+        max_shard_size="5GB",
+    )
+    tokenizer.save_pretrained(export_path)
 
     metadata = {
         "tool": "RUS — Remove Ur Refusal",
-        "version": "1.0.6",
+        "version": "1.3.1",
         "original_model": model_name,
         "exported_at": datetime.now().isoformat(),
         "quantized": any(
             p.dtype in (torch.int8, torch.uint8) for p in model.parameters()
         ) if hasattr(model, "parameters") else False,
+        "method": method_metadata or {},
+        "quantization_skip_modules": quantization_skip_modules,
         "ablation_stats": {
             str(k): {
                 "layer_path": v.get("layer_path", ""),
                 "coefficient": v.get("coefficient", 0),
                 "refusal_score": v.get("refusal_score", 0),
+                "preserve_norm": v.get("preserve_norm", False),
                 "targets": {
                     tag: {
                         "projection_before": tv.get("projection_before", 0),
@@ -153,11 +201,24 @@ def export_model(
             "compliance_after": comparison_results.get("compliance_after", 0),
             "quality_before": comparison_results.get("quality_before", 0),
             "quality_after": comparison_results.get("quality_after", 0),
+            "harmless_kl_divergence": comparison_results.get("harmless_kl_divergence"),
         },
     }
 
     metadata_path = os.path.join(export_path, "rus_metadata.json")
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
+
+    card_path = os.path.join(export_path, "README.md")
+    with open(card_path, "w") as f:
+        f.write(
+            f"# {safe_name} (RUS)\n\n"
+            f"Derived from `{model_name}` with RUS refusal-direction ablation.\n\n"
+            "## Important use notice\n\n"
+            "This transformation can weaken model safeguards and does not make "
+            "outputs accurate, lawful, or safe. Evaluate the checkpoint in an "
+            "isolated environment before deployment. See `rus_metadata.json` "
+            "for transformation and evaluation details.\n"
+        )
 
     return export_path

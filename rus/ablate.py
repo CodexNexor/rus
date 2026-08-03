@@ -4,16 +4,38 @@ Permanently modifies the model so it can no longer represent refusal.
 """
 
 import torch
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 from tqdm import tqdm
 
-from .loader import get_weight_targets, discover_layers
+from .loader import get_weight_targets
 
 
+TARGET_SUFFIXES = {
+    "o_proj": "self_attn.o_proj",
+    "c_proj": "attn.c_proj",
+    "wo": "attention.wo",
+    "down_proj": "mlp.down_proj",
+    "c_proj_mlp": "mlp.c_proj",
+    "fc2": "mlp.fc2",
+    "out_proj": "self_attn.out_proj",
+    "attn_out_proj": "attn.out_proj",
+    "attention_dense": "attention.dense",
+    "self_attention_dense": "self_attention.dense",
+    "dense_4h_to_h": "mlp.dense_4h_to_h",
+    "fc_out": "mlp.fc_out",
+    "feed_forward_w2": "feed_forward.w2",
+}
+
+
+@torch.no_grad()
 def project_direction_from_weight(
     weight: torch.Tensor,
     direction: torch.Tensor,
     coefficient: float = 0.8,
+    output_axis: int = 0,
+    preserve_norm: bool = False,
+    inplace: bool = False,
+    chunk_size: int = 1024,
 ) -> torch.Tensor:
     """
     Remove the component of `direction` from each column of `weight`.
@@ -35,8 +57,51 @@ def project_direction_from_weight(
     v_hat = direction / (direction.norm() + 1e-12)
     v_hat = v_hat.to(weight.device, weight.dtype)
 
-    col_projections = v_hat @ weight  # (d_in,) — v_hat · c_j for each column
-    weight_modified = weight - coefficient * torch.outer(v_hat, col_projections)
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    norm_dim = 0 if output_axis == 0 else 1
+    # Accumulate in fp32 without materializing a full fp32 copy of a potentially
+    # multi-hundred-MiB projection matrix.
+    original_norms = (
+        torch.linalg.vector_norm(weight, dim=norm_dim, dtype=torch.float32)
+        if preserve_norm else None
+    )
+    weight_modified = weight if inplace else weight.clone()
+
+    if output_axis == 0:
+        if weight.shape[0] != v_hat.numel():
+            raise ValueError(f"direction has {v_hat.numel()} values for weight {tuple(weight.shape)}")
+        col_projections = v_hat @ weight
+        for start in range(0, weight.shape[1], chunk_size):
+            stop = min(start + chunk_size, weight.shape[1])
+            update = v_hat.unsqueeze(1) * col_projections[start:stop].unsqueeze(0)
+            weight_modified[:, start:stop].add_(update, alpha=-coefficient)
+    elif output_axis == 1:
+        if weight.shape[1] != v_hat.numel():
+            raise ValueError(f"direction has {v_hat.numel()} values for weight {tuple(weight.shape)}")
+        row_projections = weight @ v_hat
+        for start in range(0, weight.shape[0], chunk_size):
+            stop = min(start + chunk_size, weight.shape[0])
+            update = row_projections[start:stop].unsqueeze(1) * v_hat.unsqueeze(0)
+            weight_modified[start:stop, :].add_(update, alpha=-coefficient)
+    else:
+        raise ValueError("output_axis must be 0 or 1")
+
+    # Positive rescaling cannot reintroduce a removed output direction because
+    # every affected column (or Conv1D row) remains in the same projected ray.
+    if preserve_norm:
+        modified_norms = torch.linalg.vector_norm(
+            weight_modified, dim=norm_dim, dtype=torch.float32
+        ).clamp_min(1e-12)
+        scales = (original_norms / modified_norms).to(weight_modified.dtype)
+        if output_axis == 0:
+            for start in range(0, weight.shape[1], chunk_size):
+                stop = min(start + chunk_size, weight.shape[1])
+                weight_modified[:, start:stop].mul_(scales[start:stop].unsqueeze(0))
+        else:
+            for start in range(0, weight.shape[0], chunk_size):
+                stop = min(start + chunk_size, weight.shape[0])
+                weight_modified[start:stop, :].mul_(scales[start:stop].unsqueeze(1))
 
     return weight_modified
 
@@ -81,14 +146,7 @@ def _replace_with_fp16_linear(model, layer_path: str, tag: str, fp16_weights: to
     """
     import torch.nn as nn
 
-    suffix = {
-        "o_proj": "self_attn.o_proj",
-        "c_proj": "self_attn.c_proj",
-        "wo": "attention.wo",
-        "down_proj": "mlp.down_proj",
-        "c_proj_mlp": "mlp.c_proj",
-        "fc2": "mlp.fc2",
-    }.get(tag)
+    suffix = TARGET_SUFFIXES.get(tag)
     if suffix is None:
         raise RuntimeError(f"No module path mapping for target tag: {tag}")
 
@@ -99,15 +157,18 @@ def _replace_with_fp16_linear(model, layer_path: str, tag: str, fp16_weights: to
     attr = parts[-1]
 
     in_features, out_features = fp16_weights.shape[1], fp16_weights.shape[0]
-    new_layer = nn.Linear(in_features, out_features, bias=bias is not None)
-    new_layer = new_layer.to(device=fp16_weights.device, dtype=fp16_weights.dtype)
-    with torch.no_grad():
-        new_layer.weight.copy_(fp16_weights.contiguous())
-        if bias is not None:
-            new_layer.bias.copy_(bias)
-        new_layer.weight.requires_grad = False
-        if new_layer.bias is not None:
-            new_layer.bias.requires_grad = False
+    # Construct on meta and adopt the projected tensor directly. Creating a
+    # normal Linear and copying would temporarily allocate a second full matrix.
+    new_layer = nn.Linear(
+        in_features, out_features, bias=bias is not None,
+        device="meta", dtype=fp16_weights.dtype,
+    )
+    new_layer.weight = nn.Parameter(fp16_weights.contiguous(), requires_grad=False)
+    if bias is not None:
+        new_layer.bias = nn.Parameter(
+            bias.to(device=fp16_weights.device, dtype=fp16_weights.dtype).contiguous(),
+            requires_grad=False,
+        )
 
     setattr(parent, attr, new_layer)
     return new_layer
@@ -117,25 +178,34 @@ def _extract_cb_scb(module, sd: Dict) -> tuple:
     """
     Resolve the CB/SCB pair from a bnb 8-bit module, regardless of where bnb
     stashes the scales. Variants seen in the wild:
-      a) state_dict has a "weight.SCB" key,
+      a) state_dict has an "SCB" or "weight.SCB" key,
       b) SCB lives as an attribute on the weight param itself (Int8Params.SCB),
-         and state_dict only exposes "weight".
+      c) CB/SCB have moved to Linear8bitLt.state after the first forward pass.
     Returns (cb, scb) or (None, None) for a non-8-bit module.
     """
+    weight = getattr(module, "weight", None)
+    state = getattr(module, "state", None)
     cb = sd.get("weight")
     if not isinstance(cb, torch.Tensor):
+        cb = getattr(weight, "CB", None)
+    if not isinstance(cb, torch.Tensor):
+        cb = getattr(state, "CB", None)
+    if not isinstance(cb, torch.Tensor):
         return None, None
-    scb = sd.get("weight.SCB")
+    scb = sd.get("SCB")
     if scb is None:
-        w = getattr(module, "weight", None)
-        scb = getattr(w, "SCB", None) if w is not None else None
+        scb = sd.get("weight.SCB")
+    if scb is None:
+        scb = getattr(weight, "SCB", None) if weight is not None else None
+    if scb is None:
+        scb = getattr(state, "SCB", None) if state is not None else None
     if not isinstance(scb, torch.Tensor):
         return None, None
     return cb, scb
 
 
 def _ablate_quantized_target(model, layer_path: str, tag: str, module, direction: torch.Tensor,
-                             coefficient: float) -> Dict[str, float]:
+                             coefficient: float, preserve_norm: bool = False) -> Dict[str, float]:
     """Dequantize (via module.state_dict) → project → swap in fp16 Linear."""
     sd = module.state_dict()
     cb, scb = _extract_cb_scb(module, sd)
@@ -149,7 +219,9 @@ def _ablate_quantized_target(model, layer_path: str, tag: str, module, direction
     dir_fp16 = direction.to(fp16.device, torch.float16)
 
     proj_before = (dir_fp16 @ fp16).abs().mean().item()
-    fp16_modified = project_direction_from_weight(fp16, dir_fp16, coefficient)
+    fp16_modified = project_direction_from_weight(
+        fp16, dir_fp16, coefficient, preserve_norm=preserve_norm, inplace=True
+    )
     proj_after = (dir_fp16 @ fp16_modified).abs().mean().item()
 
     bias = None
@@ -161,7 +233,9 @@ def _ablate_quantized_target(model, layer_path: str, tag: str, module, direction
     # VERIFY: the live module now holds weights with the direction removed.
     # Plain fp16 weights — measurement is deterministic, no bnb layout tricks.
     check_proj = (dir_fp16 @ new_module.weight).abs().mean().item()  # module now nn.Linear
-    if check_proj > proj_before * 0.5:
+    expected = proj_after
+    tolerance = max(proj_before * 0.08, 2e-5)
+    if abs(check_proj - expected) > tolerance:
         raise RuntimeError(
             f"Ablation did not take effect in the module "
             f"(projection {proj_before:.5f} -> {check_proj:.5f})."
@@ -175,17 +249,58 @@ def _ablate_quantized_target(model, layer_path: str, tag: str, module, direction
     }
 
 
+def _ablate_4bit_target(model, layer_path: str, tag: str, module,
+                        direction: torch.Tensor, coefficient: float,
+                        preserve_norm: bool = False) -> Dict[str, float]:
+    """Dequantize a bitsandbytes Params4bit weight and replace it with fp16."""
+    weight = module.weight
+    quant_state = getattr(weight, "quant_state", None)
+    if quant_state is None:
+        raise RuntimeError(f"Missing 4-bit quantization state for {layer_path}.{tag}")
+    try:
+        import bitsandbytes.functional as bnbf
+    except ImportError as exc:
+        raise RuntimeError("4-bit ablation requires bitsandbytes") from exc
+
+    fp16 = bnbf.dequantize_4bit(weight.data, quant_state=quant_state).to(torch.float16)
+    dir_fp16 = direction.to(fp16.device, torch.float16)
+    if fp16.shape[0] != dir_fp16.numel():
+        raise RuntimeError(
+            f"Direction/weight mismatch for {layer_path}.{tag}: "
+            f"{dir_fp16.numel()} vs {tuple(fp16.shape)}"
+        )
+    before = (dir_fp16 @ fp16).abs().mean().item()
+    modified = project_direction_from_weight(
+        fp16, dir_fp16, coefficient, preserve_norm=preserve_norm, inplace=True
+    )
+    after = (dir_fp16 @ modified).abs().mean().item()
+    bias = getattr(module, "bias", None)
+    if bias is not None:
+        bias = bias.detach().to(device=modified.device, dtype=torch.float16)
+    _replace_with_fp16_linear(model, layer_path, tag, modified, bias)
+    return {
+        "projection_before": before,
+        "projection_after": after,
+        "reduction": (before - after) / max(before, 1e-12),
+        "quantized": True,
+        "quantization_bits": 4,
+    }
+
+
 def apply_ablation_to_layer(
     model,
     layer_path: str,
     direction: torch.Tensor,
     coefficient: float = 0.8,
+    preserve_norm: bool = False,
 ) -> Dict[str, float]:
     """
     Apply refusal-direction projection to all modifiable weight targets in a layer.
     Returns stats dict with before/after metrics.
     """
     targets = get_weight_targets(model, layer_path)
+    if not targets:
+        raise RuntimeError(f"No compatible output-projection weights in {layer_path}")
     stats = {}
 
     for tag, weight in targets.items():
@@ -193,25 +308,47 @@ def apply_ablation_to_layer(
         if module is None:
             raise RuntimeError(f"Cannot locate module for {layer_path}.{tag}")
 
+        if getattr(getattr(module, "weight", None), "quant_state", None) is not None:
+            stats[tag] = _ablate_4bit_target(
+                model, layer_path, tag, module, direction, coefficient, preserve_norm
+            )
+            continue
+
         sd = module.state_dict()
         cb, scb = _extract_cb_scb(module, sd)
         if cb is not None and scb is not None:  # bnb 8-bit module (either layout)
             print(f"    [8-bit] {layer_path}.{tag}: cb={tuple(cb.shape)} scb={tuple(scb.shape)}")
-            stats[tag] = _ablate_quantized_target(model, layer_path, tag, module, direction, coefficient)
+            stats[tag] = _ablate_quantized_target(
+                model, layer_path, tag, module, direction, coefficient, preserve_norm
+            )
             continue
-        print(f"    [fp16 ] {layer_path}.{tag}: dtype={weight.dtype}")
+        if weight.dtype in (torch.int8, torch.uint8):
+            raise RuntimeError(
+                f"Packed quantized weight at {layer_path}.{tag} has no readable "
+                f"quantization state (state_dict keys={list(sd.keys())}). "
+                "Refusing to treat it as a plain matrix."
+            )
+        print(f"    [plain] {layer_path}.{tag}: dtype={weight.dtype}")
 
         # Plain fp16 path
         direction_dev = direction.to(weight.device, weight.dtype)
 
-        proj_before = (direction_dev @ weight).abs().mean().item()
+        output_axis = 1 if module.__class__.__name__ == "Conv1D" else 0
+        proj_before = (
+            (direction_dev @ weight) if output_axis == 0 else (weight @ direction_dev)
+        ).abs().mean().item()
 
-        weight_modified = project_direction_from_weight(weight, direction_dev, coefficient)
+        weight_modified = project_direction_from_weight(
+            weight, direction_dev, coefficient, output_axis=output_axis,
+            preserve_norm=preserve_norm,
+        )
 
         with torch.no_grad():
             weight.copy_(weight_modified)
 
-        proj_after = (direction_dev @ weight).abs().mean().item()
+        proj_after = (
+            (direction_dev @ weight) if output_axis == 0 else (weight @ direction_dev)
+        ).abs().mean().item()
 
         stats[tag] = {
             "projection_before": proj_before,
@@ -224,24 +361,16 @@ def apply_ablation_to_layer(
 
 def _find_module(model, layer_path: str, tag: str):
     """Walk dotted paths to the nn.Module holding a weight target."""
-    candidates = [
-        f"{layer_path}.self_attn.o_proj",
-        f"{layer_path}.self_attn.c_proj",
-        f"{layer_path}.attention.wo",
-        f"{layer_path}.mlp.down_proj",
-        f"{layer_path}.mlp.c_proj",
-        f"{layer_path}.mlp.fc2",
-    ]
-    for path in candidates:
-        obj = model
-        try:
-            for part in path.split("."):
-                obj = getattr(obj, part)
-            if hasattr(obj, "weight"):
-                return obj
-        except (AttributeError, TypeError):
-            continue
-    return None
+    suffix = TARGET_SUFFIXES.get(tag)
+    if suffix is None:
+        return None
+    obj = model
+    try:
+        for part in f"{layer_path}.{suffix}".split("."):
+            obj = getattr(obj, part)
+        return obj if hasattr(obj, "weight") else None
+    except (AttributeError, TypeError):
+        return None
 
 
 def apply_ablation(
@@ -250,6 +379,7 @@ def apply_ablation(
     layer_paths: List[str],
     coefficient: float = 0.8,
     coefficient_decay: float = 0.75,
+    preserve_norm: bool = False,
 ) -> Dict:
     """
     Apply weight-projection ablation to all selected layers.
@@ -260,22 +390,33 @@ def apply_ablation(
     Returns:
         Dict with per-layer ablation statistics.
     """
+    if not 0.0 < coefficient <= 1.0:
+        raise ValueError("coefficient must be in (0, 1]")
+    if not 0.0 < coefficient_decay <= 1.0:
+        raise ValueError("coefficient_decay must be in (0, 1]")
     all_stats = {}
 
     for rank, (layer_idx, refusal_score, direction) in enumerate(
         tqdm(selected_layers, desc="Ablating layers", unit="layer")
     ):
         coeff = coefficient * (coefficient_decay ** rank)
+        if layer_idx < 0 or layer_idx >= len(layer_paths):
+            raise IndexError(f"Layer index {layer_idx} is outside the model")
         layer_path = layer_paths[layer_idx]
 
         # NOTE: errors propagate on purpose. A silently-failed ablation would
         # save an unmodified model and fake the whole run.
-        stats = apply_ablation_to_layer(model, layer_path, direction, coeff)
+        stats = apply_ablation_to_layer(
+            model, layer_path, direction, coeff, preserve_norm=preserve_norm
+        )
         all_stats[layer_idx] = {
             "layer_path": layer_path,
             "coefficient": coeff,
             "refusal_score": refusal_score,
+            "preserve_norm": preserve_norm,
             "targets": stats,
         }
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return all_stats

@@ -1,6 +1,6 @@
 """
 RUS — Remove Ur Refusal
-Living Ablation Engine v1.0.0
+Living Ablation Engine v1.3.1
 
 Quickstart:
     import rus
@@ -16,11 +16,10 @@ Step-by-step:
     engine.save()
 
 CLI:
-    python -m rus Qwen/Qwen2.5-7B-Instruct --8bit -n 64 -k 5 -c 0.8
+    python -m rus Qwen/Qwen2.5-7B-Instruct --8bit -n 48 -k 5 -c 0.8
 """
 
-__version__ = "1.0.6"
+__version__ = "1.3.1"
 
 from .api import RusEngine, ablate
 from .cli import main  # for console script entry point
-

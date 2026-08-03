@@ -1,28 +1,27 @@
 """
-RUS Subspace Analysis — extract refusal directions from activation differences
-using PCA on differential pairs (RepE standard method).
+RUS Subspace Analysis — extract refusal directions from paired differences.
 """
 
 import torch
 import numpy as np
 from typing import List, Dict, Tuple
-from sklearn.decomposition import PCA
 
 
 def compute_refusal_directions(
     harmful_acts: Dict[int, List[torch.Tensor]],
     harmless_acts: Dict[int, List[torch.Tensor]],
     num_layers: int,
-    min_refusal_score: float = 0.3,
+    min_refusal_score: float = 0.0,
+    protect_harmless: bool = True,
 ) -> Dict[int, Dict]:
     """
-    For each layer, compute the refusal direction via PCA on activation differentials.
+    Compute the mean harmful-minus-harmless direction and an effect score.
 
     Returns:
         dict mapping layer_idx -> {
             "direction": torch.Tensor (hidden_dim,), unit vector
-            "score": float (explained variance ratio, 0-1)
-            "explained_variances": list[float]
+            "score": float (bounded standardized effect, 0-1)
+            "effect_size": float
         }
     """
     results = {}
@@ -34,27 +33,43 @@ def compute_refusal_directions(
         h_harmful = torch.cat(harmful_acts[layer_idx], dim=0).numpy()
         h_harmless = torch.cat(harmless_acts[layer_idx], dim=0).numpy()
 
-        min_n = min(len(h_harmful), len(h_harmless))
-        h_harmful = h_harmful[:min_n]
-        h_harmless = h_harmless[:min_n]
-
-        differentials = h_harmful - h_harmless
-
-        if differentials.shape[0] < 3:
+        if min(len(h_harmful), len(h_harmless)) < 3:
             continue
 
-        pca = PCA(n_components=1)
-        pca.fit(differentials)
-
-        direction = torch.from_numpy(pca.components_[0].astype(np.float32))
+        # Abliteration needs the harmful-vs-harmless mean displacement. PCA on
+        # centered differentials instead captures variation *among* prompt pairs
+        # and can be orthogonal to the actual class separation.
+        harmful_mean = h_harmful.mean(axis=0)
+        harmless_mean = h_harmless.mean(axis=0)
+        mean_diff = harmful_mean - harmless_mean
+        direction = torch.from_numpy(mean_diff.astype(np.float32))
+        harmless_direction = torch.from_numpy(harmless_mean.astype(np.float32))
+        if harmless_direction.norm() > 1e-8:
+            harmless_direction = harmless_direction / harmless_direction.norm()
+        if protect_harmless and harmless_direction.norm() > 1e-8:
+            direction = direction - torch.dot(direction, harmless_direction) * harmless_direction
+        if not torch.isfinite(direction).all() or direction.norm() < 1e-8:
+            continue
         direction = direction / direction.norm()
 
-        score = float(pca.explained_variance_ratio_[0])
+        harmful_projection = h_harmful @ direction.numpy()
+        harmless_projection = h_harmless @ direction.numpy()
+        pooled_std = np.sqrt(
+            (harmful_projection.var(ddof=1) + harmless_projection.var(ddof=1)) / 2.0
+        )
+        effect = abs(float(harmful_projection.mean() - harmless_projection.mean())) / (
+            float(pooled_std) + 1e-8
+        )
+        score = effect / (1.0 + effect)
 
         results[layer_idx] = {
             "direction": direction,
             "score": score,
-            "explained_variances": [float(v) for v in pca.explained_variance_ratio_],
+            "effect_size": effect,
+            "harmless_overlap": float(
+                torch.dot(direction, harmless_direction).abs()
+                if harmless_direction.norm() > 1e-8 else 0.0
+            ),
         }
 
     return results
@@ -94,9 +109,8 @@ def select_best_layers(
     """
     Pick the top-k layers by refusal score.
 
-    min_score is only a filter when there ARE qualifying layers. With many
-    prompts the PCA explained-variance ratios are naturally low (0.1-0.3),
-    so an absolute threshold must never empty the selection — ranking decides.
+    min_score is a filter when there are qualifying layers; ranking remains the
+    fallback so models with differently scaled activations remain usable.
     """
     if not ranked:
         return []
@@ -104,3 +118,37 @@ def select_best_layers(
     if not selected:
         return ranked[:top_k]
     return selected[:top_k]
+
+
+def build_consensus_direction(
+    ranked: List[Tuple[int, float, torch.Tensor]],
+    top_n: int = 5,
+) -> Tuple[torch.Tensor, List[int]]:
+    """Build a stable global direction from sign-aligned top layer estimates.
+
+    Residual-stream bases are shared across transformer blocks, but empirical
+    directions can flip sign and contain layer-specific noise. Aligning each
+    candidate to the best-scoring reference and taking a score-weighted mean
+    reduces that noise without increasing the erased subspace rank.
+    """
+    if top_n <= 0:
+        raise ValueError("top_n must be positive")
+    candidates = ranked[:top_n]
+    if not candidates:
+        raise ValueError("Cannot build a consensus from no directions")
+    reference = candidates[0][2].float()
+    reference = reference / reference.norm().clamp_min(1e-12)
+    aligned = []
+    weights = []
+    layers = []
+    for layer_idx, score, direction in candidates:
+        unit = direction.float() / direction.float().norm().clamp_min(1e-12)
+        if torch.dot(unit, reference) < 0:
+            unit = -unit
+        aligned.append(unit)
+        weights.append(max(float(score), 1e-6))
+        layers.append(layer_idx)
+    weight_tensor = torch.tensor(weights, dtype=torch.float32)
+    consensus = (torch.stack(aligned) * weight_tensor[:, None]).sum(dim=0)
+    consensus = consensus / consensus.norm().clamp_min(1e-12)
+    return consensus, layers

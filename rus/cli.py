@@ -2,11 +2,10 @@
 RUS CLI — Beautiful terminal interface for the Remove Ur Refusal engine.
 """
 
-import os
 import sys
 import time
-import copy
 import argparse
+import warnings
 from typing import List
 
 import torch
@@ -16,15 +15,9 @@ from rich.table import Table
 from rich.progress import (
     Progress,
     SpinnerColumn,
-    BarColumn,
     TextColumn,
-    TimeElapsedColumn,
 )
-from rich.text import Text
-from rich.align import Align
 from rich import box
-from rich.live import Live
-from rich.layout import Layout
 
 from .config import (
     DEFAULT_OUTPUT_DIR,
@@ -36,12 +29,22 @@ from .config import (
     LAYER_BLACKLIST_LAST,
     EVAL_HARMFUL_PROMPTS,
 )
-from .prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
-from .loader import load_model_and_tokenizer, discover_layers, get_device
+from .prompts import (
+    HARMFUL_PROMPTS, HARMLESS_PROMPTS,
+    EVAL_HARMFUL_PROMPTS as HELDOUT_HARMFUL_PROMPTS,
+    EVAL_HARMLESS_PROMPTS as HELDOUT_HARMLESS_PROMPTS,
+)
+from .loader import (
+    load_model_and_tokenizer, discover_layers, get_device, get_hidden_size,
+    get_device_report, parse_max_memory_spec, release_memory,
+)
 from .collector import collect_pairwise_activations
-from .subspace import compute_refusal_directions, rank_layers, select_best_layers
+from .subspace import (
+    compute_refusal_directions, rank_layers, select_best_layers,
+    build_consensus_direction,
+)
 from .ablate import apply_ablation
-from .evaluator import run_comparison
+from .evaluator import evaluate_suite, compare_suites
 from .exporter import export_model
 from .tracker import log_run, get_insights
 
@@ -58,7 +61,7 @@ LOGO = r"""[bold bright_magenta]
 ║   ██║  ██║ ╚██████╔╝ ███████║                                ║
 ║   ╚═╝  ╚═╝  ╚═════╝  ╚══════╝                                ║
 ║                                                              ║
-║   Remove Ur Refusal — Living Ablation Engine v1.0.0           ║
+║   Remove Ur Refusal — Living Ablation Engine v1.3.1           ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 [/bold bright_magenta]"""
@@ -93,32 +96,31 @@ def build_layer_table(
     skip_first = LAYER_BLACKLIST_FIRST
     skip_last = LAYER_BLACKLIST_LAST
 
-    shown = 0
-    for layer_idx in range(total_layers):
-        if shown >= top_n:
-            break
-        if layer_idx < skip_first or layer_idx >= total_layers - skip_last:
-            continue
+    eligible = [
+        (layer_idx, info)
+        for layer_idx, info in directions.items()
+        if skip_first <= layer_idx < total_layers - skip_last
+    ]
+    eligible.sort(key=lambda item: item[1]["score"], reverse=True)
 
-        if layer_idx in directions:
-            score = directions[layer_idx]["score"]
-            bar_len = int(score * 20)
-            bar = "[bright_green]" + "█" * bar_len + "[/]" + "░" * (20 - bar_len)
+    for layer_idx, info in eligible[:top_n]:
+        score = info["score"]
+        bar_len = int(score * 20)
+        bar = "[bright_green]" + "█" * bar_len + "[/]" + "░" * (20 - bar_len)
 
-            if layer_idx in selected_layers:
-                status = "[bold bright_yellow]★ SELECTED[/]"
-            elif score >= 0.5:
-                status = "[dim]candidate[/]"
-            else:
-                status = "[dim]low signal[/]"
+        if layer_idx in selected_layers:
+            status = "[bold bright_yellow]★ SELECTED[/]"
+        elif score >= 0.5:
+            status = "[dim]candidate[/]"
+        else:
+            status = "[dim]low signal[/]"
 
-            table.add_row(
-                str(layer_idx),
-                f"{score:.4f}",
-                bar,
-                status,
-            )
-            shown += 1
+        table.add_row(
+            str(layer_idx),
+            f"{score:.4f}",
+            bar,
+            status,
+        )
 
     return table
 
@@ -169,6 +171,14 @@ def build_comparison_table(results: dict) -> Table:
         "",
         f"[bold green]{refusal_reduction:+.1%}[/]",
     )
+    kl = results.get("harmless_kl_divergence")
+    if kl is not None:
+        table.add_row(
+            "Harmless KL drift",
+            "0.0000",
+            f"{kl:.4f}",
+            "[green]low[/]" if kl < 0.1 else "[yellow]review[/]",
+        )
 
     return table
 
@@ -225,6 +235,13 @@ def run_pipeline(
     selected_layers_override: List[int] = None,
     load_in_8bit: bool = False,
     load_in_4bit: bool = False,
+    trust_remote_code: bool = False,
+    strategy: str = "global",
+    preserve_norm: bool = True,
+    protect_harmless: bool = True,
+    device_map="auto",
+    max_memory: dict = None,
+    offload_folder: str = None,
 ):
     """
     Execute the complete RUS pipeline:
@@ -253,13 +270,26 @@ def run_pipeline(
             model_name,
             load_in_8bit=load_in_8bit,
             load_in_4bit=load_in_4bit,
+            trust_remote_code=trust_remote_code,
+            device_map=device_map,
+            max_memory=max_memory,
+            offload_folder=offload_folder,
         )
 
     device = get_device(model)
     layer_paths, num_layers = discover_layers(model)
-    hidden_size = model.config.hidden_size
+    hidden_size = get_hidden_size(model)
     console.print(f"  Architecture: [cyan]{num_layers} layers[/], [cyan]{hidden_size}d hidden[/]")
     console.print(f"  ✓ Model loaded on [green]{device}[/]\n")
+    report = get_device_report(model)
+    for gpu in report["gpus"]:
+        console.print(
+            f"  GPU {gpu['index']}: [cyan]{gpu['name']}[/] | "
+            f"allocated={gpu['allocated_gib']:.2f} GiB | "
+            f"free={gpu['free_gib']:.2f}/{gpu['total_gib']:.2f} GiB"
+        )
+    if report["module_placement"]:
+        console.print(f"  Module placement: [cyan]{report['module_placement']}[/]\n")
 
     # ── Step 2: Collect Activations ────────────────────
     console.print("[bold bright_magenta](2/6) Collecting activations...[/]")
@@ -276,7 +306,12 @@ def run_pipeline(
     # ── Step 3: Compute Refusal Subspace ───────────────
     console.print("[bold bright_magenta](3/6) Computing refusal subspace...[/]")
 
-    directions = compute_refusal_directions(harmful_acts, harmless_acts, num_layers)
+    directions = compute_refusal_directions(
+        harmful_acts, harmless_acts, num_layers,
+        protect_harmless=protect_harmless,
+    )
+    del harmful_acts, harmless_acts
+    release_memory()
     ranked = rank_layers(directions, LAYER_BLACKLIST_FIRST, LAYER_BLACKLIST_LAST)
 
     if selected_layers_override:
@@ -295,6 +330,13 @@ def run_pipeline(
     console.print(table)
     console.print()
 
+    baseline_results = None
+    if not skip_eval:
+        console.print("  Capturing held-out baseline before modifying weights...")
+        baseline_results = evaluate_suite(
+            model, tokenizer, HELDOUT_HARMFUL_PROMPTS, HELDOUT_HARMLESS_PROMPTS
+        )
+
     # ── Step 4: Apply Ablation ─────────────────────────
     console.print("[bold bright_magenta](4/6) Applying weight projection ablation...[/]")
 
@@ -302,8 +344,21 @@ def run_pipeline(
         console.print("[red]No suitable layers found for ablation. Exiting.[/]")
         return
 
-    for rank, (layer_idx, score, direction) in enumerate(selected):
-        coeff = coefficient * (DEFAULT_COEFFICIENT_DECAY ** rank)
+    if strategy in {"global", "global_top_k"}:
+        consensus, source_layers = build_consensus_direction(selected, len(selected))
+        destinations = ranked if strategy == "global" else selected
+        ablation_selected = [(l, s, consensus) for l, s, _ in destinations]
+        coefficient_decay = 1.0
+        console.print(
+            f"  Global consensus from layers [cyan]{source_layers}[/] -> "
+            f"[cyan]{len(ablation_selected)}[/] destination layers"
+        )
+    else:
+        ablation_selected = selected
+        coefficient_decay = DEFAULT_COEFFICIENT_DECAY
+
+    for rank, (layer_idx, score, direction) in enumerate(ablation_selected):
+        coeff = coefficient * (coefficient_decay ** rank)
         console.print(
             f"  Layer [cyan]{layer_idx}[/] | "
             f"score=[yellow]{score:.4f}[/] | "
@@ -312,11 +367,13 @@ def run_pipeline(
 
     ablation_stats = apply_ablation(
         model,
-        selected,
+        ablation_selected,
         layer_paths,
         coefficient=coefficient,
-        coefficient_decay=DEFAULT_COEFFICIENT_DECAY,
+        coefficient_decay=coefficient_decay,
+        preserve_norm=preserve_norm,
     )
+    release_memory()
 
     reductions = []
     for layer_idx, stats in ablation_stats.items():
@@ -343,19 +400,10 @@ def run_pipeline(
         console.print("[bold bright_magenta](5/6) Running before/after comparison...")
         console.print(f"  Testing [cyan]{EVAL_HARMFUL_PROMPTS}[/] harmful + harmless prompts")
 
-        model_before, _ = load_model_and_tokenizer(
-            model_name,
-            load_in_8bit=load_in_8bit,
-            load_in_4bit=load_in_4bit,
+        after_results = evaluate_suite(
+            model, tokenizer, HELDOUT_HARMFUL_PROMPTS, HELDOUT_HARMLESS_PROMPTS
         )
-
-        comparison_results = run_comparison(
-            model_before, model, tokenizer,
-            HARMFUL_PROMPTS, HARMLESS_PROMPTS,
-        )
-
-        del model_before
-        torch.cuda.empty_cache()
+        comparison_results = compare_suites(baseline_results, after_results)
 
         comp_table = build_comparison_table(comparison_results)
         console.print(comp_table)
@@ -371,6 +419,12 @@ def run_pipeline(
     export_path = export_model(
         model, tokenizer, output_dir, model_name,
         ablation_stats, comparison_results,
+        method_metadata={
+            "strategy": strategy,
+            "source_layers": [item[0] for item in selected],
+            "destination_layers": [item[0] for item in ablation_selected],
+            "protect_harmless": protect_harmless,
+        },
     )
 
     duration = time.time() - start_time
@@ -385,15 +439,16 @@ def run_pipeline(
             num_prompts=n_use,
             top_k=top_k,
             coefficient=coefficient,
-            layers_modified=[s[0] for s in selected],
-            coefficients_used=[coefficient * (DEFAULT_COEFFICIENT_DECAY ** r) for r in range(len(selected))],
+            layers_modified=[s[0] for s in ablation_selected],
+            coefficients_used=[coefficient * (coefficient_decay ** r) for r in range(len(ablation_selected))],
             comparison=comparison_results,
             export_path=export_path,
             duration_seconds=duration,
             layer_refusal_scores=layer_refusal_scores,
+            ablation_stats=ablation_stats,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        warnings.warn(f"Model exported, but run tracking failed: {exc}")
 
     export_panel = build_export_panel(export_path)
     console.print(export_panel)
@@ -464,8 +519,59 @@ def main():
         action="store_true",
         help="Show learned insights for the model family and exit",
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow custom Python code from the model repository (security-sensitive)",
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=("global", "global_top_k", "per_layer"),
+        default="global",
+        help="Full global, memory-safe global top-k, or legacy per-layer ablation",
+    )
+    parser.add_argument(
+        "--no-norm-preserve",
+        action="store_false",
+        dest="preserve_norm",
+        help="Disable post-projection weight-vector norm restoration",
+    )
+    parser.add_argument(
+        "--no-protect-harmless",
+        action="store_false",
+        dest="protect_harmless",
+        help="Keep refusal-direction components parallel to the harmless mean",
+    )
+    parser.add_argument(
+        "--device-map",
+        choices=("auto", "balanced", "balanced_low_0", "sequential"),
+        default="auto",
+        help="Accelerate model-parallel placement strategy",
+    )
+    parser.add_argument(
+        "--max-memory",
+        default=None,
+        help="Comma-separated limits, e.g. 0=12GiB,1=13GiB,cpu=24GiB",
+    )
+    parser.add_argument(
+        "--offload-folder",
+        default=None,
+        help="Optional folder for disk-offloaded weights",
+    )
 
     args = parser.parse_args()
+
+    try:
+        max_memory = parse_max_memory_spec(args.max_memory)
+    except (ValueError, TypeError):
+        parser.error("--max-memory must look like 0=12GiB,1=13GiB,cpu=24GiB")
+
+    if args.load_in_8bit and args.load_in_4bit:
+        parser.error("--8bit and --4bit are mutually exclusive")
+    if not 0.0 < args.coefficient <= 1.0:
+        parser.error("--coefficient must be in (0, 1]")
+    if args.top_k <= 0 or args.num_prompts < 3:
+        parser.error("--top-k must be positive and --num-prompts must be at least 3")
 
     if args.insights and args.model:
         family = args.model.lower()
@@ -505,6 +611,13 @@ def main():
         selected_layers_override=selected_layers,
         load_in_8bit=args.load_in_8bit,
         load_in_4bit=args.load_in_4bit,
+        trust_remote_code=args.trust_remote_code,
+        strategy=args.strategy,
+        preserve_norm=args.preserve_norm,
+        protect_harmless=args.protect_harmless,
+        device_map=args.device_map,
+        max_memory=max_memory,
+        offload_folder=args.offload_folder,
     )
 
 

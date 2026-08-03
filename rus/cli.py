@@ -55,7 +55,7 @@ LOGO = r"""[bold bright_magenta]
 ║   ██║  ██║ ╚██████╔╝ ███████║                                ║
 ║   ╚═╝  ╚═╝  ╚═════╝  ╚══════╝                                ║
 ║                                                              ║
-║   Remove Ur Refusal — Living Ablation Engine v1.1.0           ║
+║   Remove Ur Refusal — Living Ablation Engine v1.1.1           ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 [/bold bright_magenta]"""

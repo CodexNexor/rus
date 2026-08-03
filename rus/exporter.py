@@ -128,7 +128,7 @@ def export_model(
 
     metadata = {
         "tool": "RUS — Remove Ur Refusal",
-        "version": "1.1.0",
+        "version": "1.1.1",
         "original_model": model_name,
         "exported_at": datetime.now().isoformat(),
         "quantized": any(

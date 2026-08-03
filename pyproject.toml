@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rus-ablation"
-version = "1.1.0"
+version = "1.1.1"
 description = "RUS — Remove Ur Refusal. Living refusal ablation engine for language models."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -27,12 +27,15 @@ TARGET_SUFFIXES = {
 }
 
 
+@torch.no_grad()
 def project_direction_from_weight(
     weight: torch.Tensor,
     direction: torch.Tensor,
     coefficient: float = 0.8,
     output_axis: int = 0,
     preserve_norm: bool = False,
+    inplace: bool = False,
+    chunk_size: int = 1024,
 ) -> torch.Tensor:
     """
     Remove the component of `direction` from each column of `weight`.
@@ -54,31 +57,51 @@ def project_direction_from_weight(
     v_hat = direction / (direction.norm() + 1e-12)
     v_hat = v_hat.to(weight.device, weight.dtype)
 
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
     norm_dim = 0 if output_axis == 0 else 1
-    original_norms = weight.float().norm(dim=norm_dim) if preserve_norm else None
+    # Accumulate in fp32 without materializing a full fp32 copy of a potentially
+    # multi-hundred-MiB projection matrix.
+    original_norms = (
+        torch.linalg.vector_norm(weight, dim=norm_dim, dtype=torch.float32)
+        if preserve_norm else None
+    )
+    weight_modified = weight if inplace else weight.clone()
 
     if output_axis == 0:
         if weight.shape[0] != v_hat.numel():
             raise ValueError(f"direction has {v_hat.numel()} values for weight {tuple(weight.shape)}")
         col_projections = v_hat @ weight
-        weight_modified = weight - coefficient * torch.outer(v_hat, col_projections)
+        for start in range(0, weight.shape[1], chunk_size):
+            stop = min(start + chunk_size, weight.shape[1])
+            update = v_hat.unsqueeze(1) * col_projections[start:stop].unsqueeze(0)
+            weight_modified[:, start:stop].add_(update, alpha=-coefficient)
     elif output_axis == 1:
         if weight.shape[1] != v_hat.numel():
             raise ValueError(f"direction has {v_hat.numel()} values for weight {tuple(weight.shape)}")
         row_projections = weight @ v_hat
-        weight_modified = weight - coefficient * torch.outer(row_projections, v_hat)
+        for start in range(0, weight.shape[0], chunk_size):
+            stop = min(start + chunk_size, weight.shape[0])
+            update = row_projections[start:stop].unsqueeze(1) * v_hat.unsqueeze(0)
+            weight_modified[start:stop, :].add_(update, alpha=-coefficient)
     else:
         raise ValueError("output_axis must be 0 or 1")
 
     # Positive rescaling cannot reintroduce a removed output direction because
     # every affected column (or Conv1D row) remains in the same projected ray.
     if preserve_norm:
-        modified_norms = weight_modified.float().norm(dim=norm_dim).clamp_min(1e-12)
+        modified_norms = torch.linalg.vector_norm(
+            weight_modified, dim=norm_dim, dtype=torch.float32
+        ).clamp_min(1e-12)
         scales = (original_norms / modified_norms).to(weight_modified.dtype)
         if output_axis == 0:
-            weight_modified = weight_modified * scales.unsqueeze(0)
+            for start in range(0, weight.shape[1], chunk_size):
+                stop = min(start + chunk_size, weight.shape[1])
+                weight_modified[:, start:stop].mul_(scales[start:stop].unsqueeze(0))
         else:
-            weight_modified = weight_modified * scales.unsqueeze(1)
+            for start in range(0, weight.shape[0], chunk_size):
+                stop = min(start + chunk_size, weight.shape[0])
+                weight_modified[start:stop, :].mul_(scales[start:stop].unsqueeze(1))
 
     return weight_modified
 
@@ -134,15 +157,18 @@ def _replace_with_fp16_linear(model, layer_path: str, tag: str, fp16_weights: to
     attr = parts[-1]
 
     in_features, out_features = fp16_weights.shape[1], fp16_weights.shape[0]
-    new_layer = nn.Linear(in_features, out_features, bias=bias is not None)
-    new_layer = new_layer.to(device=fp16_weights.device, dtype=fp16_weights.dtype)
-    with torch.no_grad():
-        new_layer.weight.copy_(fp16_weights.contiguous())
-        if bias is not None:
-            new_layer.bias.copy_(bias)
-        new_layer.weight.requires_grad = False
-        if new_layer.bias is not None:
-            new_layer.bias.requires_grad = False
+    # Construct on meta and adopt the projected tensor directly. Creating a
+    # normal Linear and copying would temporarily allocate a second full matrix.
+    new_layer = nn.Linear(
+        in_features, out_features, bias=bias is not None,
+        device="meta", dtype=fp16_weights.dtype,
+    )
+    new_layer.weight = nn.Parameter(fp16_weights.contiguous(), requires_grad=False)
+    if bias is not None:
+        new_layer.bias = nn.Parameter(
+            bias.to(device=fp16_weights.device, dtype=fp16_weights.dtype).contiguous(),
+            requires_grad=False,
+        )
 
     setattr(parent, attr, new_layer)
     return new_layer
@@ -194,7 +220,7 @@ def _ablate_quantized_target(model, layer_path: str, tag: str, module, direction
 
     proj_before = (dir_fp16 @ fp16).abs().mean().item()
     fp16_modified = project_direction_from_weight(
-        fp16, dir_fp16, coefficient, preserve_norm=preserve_norm
+        fp16, dir_fp16, coefficient, preserve_norm=preserve_norm, inplace=True
     )
     proj_after = (dir_fp16 @ fp16_modified).abs().mean().item()
 
@@ -245,7 +271,7 @@ def _ablate_4bit_target(model, layer_path: str, tag: str, module,
         )
     before = (dir_fp16 @ fp16).abs().mean().item()
     modified = project_direction_from_weight(
-        fp16, dir_fp16, coefficient, preserve_norm=preserve_norm
+        fp16, dir_fp16, coefficient, preserve_norm=preserve_norm, inplace=True
     )
     after = (dir_fp16 @ modified).abs().mean().item()
     bias = getattr(module, "bias", None)
@@ -390,5 +416,7 @@ def apply_ablation(
             "preserve_norm": preserve_norm,
             "targets": stats,
         }
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return all_stats

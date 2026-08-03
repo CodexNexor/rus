@@ -40,10 +40,10 @@ all compatible residual-writing output projections with norm preservation. See
 
 Open [`rus_kaggle_dual_t4_14b.ipynb`](rus_kaggle_dual_t4_14b.ipynb) in a Kaggle
 GPU notebook and select the **GPU T4 x2** accelerator. The notebook loads
-`deepseek-ai/DeepSeek-R1-Distill-Qwen-14B` in 4-bit mode, balances transformer
-modules over both GPUs, prints per-GPU memory use, verifies placement, runs the
-pipeline, then reloads the exported checkpoint and performs a real forward
-pass. This larger workflow intentionally requires two GPUs.
+`deepseek-ai/DeepSeek-R1-Distill-Qwen-14B` in 4-bit mode, explicitly splits its
+48 transformer layers evenly over both GPUs, prints per-GPU memory use, verifies
+placement, runs the pipeline, then reloads the exported checkpoint and performs
+a real forward pass. This larger workflow intentionally requires two GPUs.
 
 The equivalent CLI settings are:
 
@@ -68,7 +68,8 @@ so this is not tensor-parallel speed scaling.
   BLOOM/Falcon-style output-projection names.
 - Accelerate `auto`, `balanced`, `balanced_low_0`, explicit device maps,
   per-device memory limits, and optional CPU/disk offload.
-- Global consensus and legacy per-layer ablation strategies.
+- Full global consensus, memory-safe top-k consensus, and legacy per-layer
+  ablation strategies.
 - Harmless-direction protection, norm preservation, and held-out KL drift.
 
 Architectures vary. RUS fails explicitly when it cannot discover compatible

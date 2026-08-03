@@ -61,7 +61,7 @@ LOGO = r"""[bold bright_magenta]
 ║   ██║  ██║ ╚██████╔╝ ███████║                                ║
 ║   ╚═╝  ╚═╝  ╚═════╝  ╚══════╝                                ║
 ║                                                              ║
-║   Remove Ur Refusal — Living Ablation Engine v1.3.0           ║
+║   Remove Ur Refusal — Living Ablation Engine v1.3.1           ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 [/bold bright_magenta]"""
@@ -344,9 +344,10 @@ def run_pipeline(
         console.print("[red]No suitable layers found for ablation. Exiting.[/]")
         return
 
-    if strategy == "global":
+    if strategy in {"global", "global_top_k"}:
         consensus, source_layers = build_consensus_direction(selected, len(selected))
-        ablation_selected = [(l, s, consensus) for l, s, _ in ranked]
+        destinations = ranked if strategy == "global" else selected
+        ablation_selected = [(l, s, consensus) for l, s, _ in destinations]
         coefficient_decay = 1.0
         console.print(
             f"  Global consensus from layers [cyan]{source_layers}[/] -> "
@@ -525,9 +526,9 @@ def main():
     )
     parser.add_argument(
         "--strategy",
-        choices=("global", "per_layer"),
+        choices=("global", "global_top_k", "per_layer"),
         default="global",
-        help="Global consensus ablation (paper-aligned) or legacy per-layer top-k",
+        help="Full global, memory-safe global top-k, or legacy per-layer ablation",
     )
     parser.add_argument(
         "--no-norm-preserve",

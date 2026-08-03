@@ -181,7 +181,8 @@ class RusEngine:
             layers: Manual layer list (overrides auto-detection)
             capture_baseline: Cache held-out behavior before in-place modification
             strategy: ``global`` uses a consensus direction at every eligible
-                destination layer; ``per_layer`` keeps the legacy top-k edit.
+                destination layer; ``global_top_k`` uses that consensus only at
+                the top-k destinations; ``per_layer`` keeps the legacy edit.
             preserve_norm: Restore each projected weight vector's original norm.
         """
         if self.model is None:
@@ -202,10 +203,11 @@ class RusEngine:
                 self.model, self.tokenizer,
                 EVAL_HARMFUL_PROMPTS, EVAL_HARMLESS_PROMPTS,
             )
+            release_memory()
         self._coefficient = coeff
 
-        if strategy not in {"global", "per_layer"}:
-            raise ValueError("strategy must be 'global' or 'per_layer'")
+        if strategy not in {"global", "global_top_k", "per_layer"}:
+            raise ValueError("strategy must be 'global', 'global_top_k', or 'per_layer'")
 
         if layers:
             invalid = [l for l in layers if l not in self.directions]
@@ -224,13 +226,14 @@ class RusEngine:
 
         self.source_layers = [item[0] for item in source_candidates]
         self.ablation_strategy = strategy
-        if strategy == "global":
+        if strategy in {"global", "global_top_k"}:
             consensus, self.source_layers = build_consensus_direction(
                 source_candidates, len(source_candidates)
             )
+            destinations = self.ranked_layers if strategy == "global" else source_candidates
             self.selected_layers = [
                 (layer_idx, score, consensus)
-                for layer_idx, score, _ in self.ranked_layers
+                for layer_idx, score, _ in destinations
             ]
             coefficient_decay = 1.0
         else:

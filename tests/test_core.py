@@ -117,6 +117,25 @@ def test_norm_preserving_projection():
     print("PASS test_norm_preserving_projection")
 
 
+def test_chunked_inplace_projection():
+    """The low-memory path reuses storage and matches the regular projection."""
+    torch.manual_seed(14)
+    weight = torch.randn(256, 384, dtype=torch.float16)
+    direction = torch.randn(256, dtype=torch.float16)
+    expected = project_direction_from_weight(
+        weight, direction, coefficient=0.8, preserve_norm=True, chunk_size=31
+    )
+    candidate = weight.clone()
+    pointer = candidate.data_ptr()
+    actual = project_direction_from_weight(
+        candidate, direction, coefficient=0.8, preserve_norm=True,
+        inplace=True, chunk_size=31,
+    )
+    assert actual.data_ptr() == pointer
+    assert torch.allclose(actual, expected, rtol=2e-3, atol=2e-3)
+    print("PASS test_chunked_inplace_projection")
+
+
 class _Indexable:
     """Emulates nn.ModuleList: getattr(ml, '0') resolves via _modules."""
 
@@ -460,6 +479,40 @@ def test_dual_gpu_memory_map_and_parser():
     print("PASS test_dual_gpu_memory_map_and_parser")
 
 
+def test_global_top_k_limits_destinations():
+    """Consensus mode for large models edits only the requested destinations."""
+    import rus.api as api
+
+    engine = api.RusEngine("fake/model")
+    engine.model = object()
+    engine.tokenizer = object()
+    engine.layer_paths = [f"model.layers.{index}" for index in range(8)]
+    engine.directions = {
+        index: {"score": 1.0 - index / 10, "direction": torch.randn(16)}
+        for index in range(8)
+    }
+    engine.ranked_layers = [
+        (index, info["score"], info["direction"])
+        for index, info in engine.directions.items()
+    ]
+    engine.baseline_results = {"already": "captured"}
+    captured = {}
+    old_apply = api.apply_ablation
+    api.apply_ablation = lambda model, selected, paths, **kwargs: captured.setdefault(
+        "selected", selected
+    ) or {}
+    try:
+        engine.ablate(k=3, strategy="global_top_k", capture_baseline=False)
+    finally:
+        api.apply_ablation = old_apply
+    assert len(engine.selected_layers) == 3
+    assert len(captured["selected"]) == 3
+    assert engine.source_layers == [0, 1, 2]
+    directions = [item[2] for item in engine.selected_layers]
+    assert all(torch.equal(directions[0], item) for item in directions[1:])
+    print("PASS test_global_top_k_limits_destinations")
+
+
 def _architecture_model(attention_name, attention_projection, mlp_projection):
     """Build an nn.Module tree matching common Transformers naming schemes."""
     layer = torch.nn.Module()
@@ -501,6 +554,7 @@ if __name__ == "__main__":
     test_projection()
     test_transposed_projection()
     test_norm_preserving_projection()
+    test_chunked_inplace_projection()
     test_quantized_ablation_path()
     test_quantized_scb_layouts()
     test_packed_weight_never_uses_plain_path()
@@ -508,6 +562,7 @@ if __name__ == "__main__":
     test_4bit_ablation_path()
     test_apply_ablation_raises_on_failure()
     test_dual_gpu_memory_map_and_parser()
+    test_global_top_k_limits_destinations()
     test_broad_architecture_projection_targets()
     test_exporter_shards()
     test_quantized_export_skip_modules()

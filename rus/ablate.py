@@ -4,16 +4,27 @@ Permanently modifies the model so it can no longer represent refusal.
 """
 
 import torch
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 from tqdm import tqdm
 
-from .loader import get_weight_targets, discover_layers
+from .loader import get_weight_targets
+
+
+TARGET_SUFFIXES = {
+    "o_proj": "self_attn.o_proj",
+    "c_proj": "attn.c_proj",
+    "wo": "attention.wo",
+    "down_proj": "mlp.down_proj",
+    "c_proj_mlp": "mlp.c_proj",
+    "fc2": "mlp.fc2",
+}
 
 
 def project_direction_from_weight(
     weight: torch.Tensor,
     direction: torch.Tensor,
     coefficient: float = 0.8,
+    output_axis: int = 0,
 ) -> torch.Tensor:
     """
     Remove the component of `direction` from each column of `weight`.
@@ -35,8 +46,18 @@ def project_direction_from_weight(
     v_hat = direction / (direction.norm() + 1e-12)
     v_hat = v_hat.to(weight.device, weight.dtype)
 
-    col_projections = v_hat @ weight  # (d_in,) — v_hat · c_j for each column
-    weight_modified = weight - coefficient * torch.outer(v_hat, col_projections)
+    if output_axis == 0:
+        if weight.shape[0] != v_hat.numel():
+            raise ValueError(f"direction has {v_hat.numel()} values for weight {tuple(weight.shape)}")
+        col_projections = v_hat @ weight
+        weight_modified = weight - coefficient * torch.outer(v_hat, col_projections)
+    elif output_axis == 1:
+        if weight.shape[1] != v_hat.numel():
+            raise ValueError(f"direction has {v_hat.numel()} values for weight {tuple(weight.shape)}")
+        row_projections = weight @ v_hat
+        weight_modified = weight - coefficient * torch.outer(row_projections, v_hat)
+    else:
+        raise ValueError("output_axis must be 0 or 1")
 
     return weight_modified
 
@@ -81,14 +102,7 @@ def _replace_with_fp16_linear(model, layer_path: str, tag: str, fp16_weights: to
     """
     import torch.nn as nn
 
-    suffix = {
-        "o_proj": "self_attn.o_proj",
-        "c_proj": "self_attn.c_proj",
-        "wo": "attention.wo",
-        "down_proj": "mlp.down_proj",
-        "c_proj_mlp": "mlp.c_proj",
-        "fc2": "mlp.fc2",
-    }.get(tag)
+    suffix = TARGET_SUFFIXES.get(tag)
     if suffix is None:
         raise RuntimeError(f"No module path mapping for target tag: {tag}")
 
@@ -161,7 +175,9 @@ def _ablate_quantized_target(model, layer_path: str, tag: str, module, direction
     # VERIFY: the live module now holds weights with the direction removed.
     # Plain fp16 weights — measurement is deterministic, no bnb layout tricks.
     check_proj = (dir_fp16 @ new_module.weight).abs().mean().item()  # module now nn.Linear
-    if check_proj > proj_before * 0.5:
+    expected = proj_before * abs(1.0 - coefficient)
+    tolerance = max(proj_before * 0.08, 2e-5)
+    if abs(check_proj - expected) > tolerance:
         raise RuntimeError(
             f"Ablation did not take effect in the module "
             f"(projection {proj_before:.5f} -> {check_proj:.5f})."
@@ -172,6 +188,41 @@ def _ablate_quantized_target(model, layer_path: str, tag: str, module, direction
         "projection_after": proj_after,
         "reduction": (proj_before - proj_after) / max(proj_before, 1e-12),
         "quantized": True,
+    }
+
+
+def _ablate_4bit_target(model, layer_path: str, tag: str, module,
+                        direction: torch.Tensor, coefficient: float) -> Dict[str, float]:
+    """Dequantize a bitsandbytes Params4bit weight and replace it with fp16."""
+    weight = module.weight
+    quant_state = getattr(weight, "quant_state", None)
+    if quant_state is None:
+        raise RuntimeError(f"Missing 4-bit quantization state for {layer_path}.{tag}")
+    try:
+        import bitsandbytes.functional as bnbf
+    except ImportError as exc:
+        raise RuntimeError("4-bit ablation requires bitsandbytes") from exc
+
+    fp16 = bnbf.dequantize_4bit(weight.data, quant_state=quant_state).to(torch.float16)
+    dir_fp16 = direction.to(fp16.device, torch.float16)
+    if fp16.shape[0] != dir_fp16.numel():
+        raise RuntimeError(
+            f"Direction/weight mismatch for {layer_path}.{tag}: "
+            f"{dir_fp16.numel()} vs {tuple(fp16.shape)}"
+        )
+    before = (dir_fp16 @ fp16).abs().mean().item()
+    modified = project_direction_from_weight(fp16, dir_fp16, coefficient)
+    after = (dir_fp16 @ modified).abs().mean().item()
+    bias = getattr(module, "bias", None)
+    if bias is not None:
+        bias = bias.detach().to(device=modified.device, dtype=torch.float16)
+    _replace_with_fp16_linear(model, layer_path, tag, modified, bias)
+    return {
+        "projection_before": before,
+        "projection_after": after,
+        "reduction": (before - after) / max(before, 1e-12),
+        "quantized": True,
+        "quantization_bits": 4,
     }
 
 
@@ -186,12 +237,20 @@ def apply_ablation_to_layer(
     Returns stats dict with before/after metrics.
     """
     targets = get_weight_targets(model, layer_path)
+    if not targets:
+        raise RuntimeError(f"No compatible output-projection weights in {layer_path}")
     stats = {}
 
     for tag, weight in targets.items():
         module = _find_module(model, layer_path, tag)
         if module is None:
             raise RuntimeError(f"Cannot locate module for {layer_path}.{tag}")
+
+        if getattr(getattr(module, "weight", None), "quant_state", None) is not None:
+            stats[tag] = _ablate_4bit_target(
+                model, layer_path, tag, module, direction, coefficient
+            )
+            continue
 
         sd = module.state_dict()
         cb, scb = _extract_cb_scb(module, sd)
@@ -204,14 +263,21 @@ def apply_ablation_to_layer(
         # Plain fp16 path
         direction_dev = direction.to(weight.device, weight.dtype)
 
-        proj_before = (direction_dev @ weight).abs().mean().item()
+        output_axis = 1 if module.__class__.__name__ == "Conv1D" else 0
+        proj_before = (
+            (direction_dev @ weight) if output_axis == 0 else (weight @ direction_dev)
+        ).abs().mean().item()
 
-        weight_modified = project_direction_from_weight(weight, direction_dev, coefficient)
+        weight_modified = project_direction_from_weight(
+            weight, direction_dev, coefficient, output_axis=output_axis
+        )
 
         with torch.no_grad():
             weight.copy_(weight_modified)
 
-        proj_after = (direction_dev @ weight).abs().mean().item()
+        proj_after = (
+            (direction_dev @ weight) if output_axis == 0 else (weight @ direction_dev)
+        ).abs().mean().item()
 
         stats[tag] = {
             "projection_before": proj_before,
@@ -224,24 +290,16 @@ def apply_ablation_to_layer(
 
 def _find_module(model, layer_path: str, tag: str):
     """Walk dotted paths to the nn.Module holding a weight target."""
-    candidates = [
-        f"{layer_path}.self_attn.o_proj",
-        f"{layer_path}.self_attn.c_proj",
-        f"{layer_path}.attention.wo",
-        f"{layer_path}.mlp.down_proj",
-        f"{layer_path}.mlp.c_proj",
-        f"{layer_path}.mlp.fc2",
-    ]
-    for path in candidates:
-        obj = model
-        try:
-            for part in path.split("."):
-                obj = getattr(obj, part)
-            if hasattr(obj, "weight"):
-                return obj
-        except (AttributeError, TypeError):
-            continue
-    return None
+    suffix = TARGET_SUFFIXES.get(tag)
+    if suffix is None:
+        return None
+    obj = model
+    try:
+        for part in f"{layer_path}.{suffix}".split("."):
+            obj = getattr(obj, part)
+        return obj if hasattr(obj, "weight") else None
+    except (AttributeError, TypeError):
+        return None
 
 
 def apply_ablation(
@@ -260,12 +318,18 @@ def apply_ablation(
     Returns:
         Dict with per-layer ablation statistics.
     """
+    if not 0.0 < coefficient <= 1.0:
+        raise ValueError("coefficient must be in (0, 1]")
+    if not 0.0 < coefficient_decay <= 1.0:
+        raise ValueError("coefficient_decay must be in (0, 1]")
     all_stats = {}
 
     for rank, (layer_idx, refusal_score, direction) in enumerate(
         tqdm(selected_layers, desc="Ablating layers", unit="layer")
     ):
         coeff = coefficient * (coefficient_decay ** rank)
+        if layer_idx < 0 or layer_idx >= len(layer_paths):
+            raise IndexError(f"Layer index {layer_idx} is outside the model")
         layer_path = layer_paths[layer_idx]
 
         # NOTE: errors propagate on purpose. A silently-failed ablation would

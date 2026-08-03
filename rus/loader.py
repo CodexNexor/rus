@@ -28,6 +28,7 @@ def load_model_and_tokenizer(
     device_map: str = DEFAULT_DEVICE_MAP,
     load_in_8bit: bool = False,
     load_in_4bit: bool = False,
+    trust_remote_code: bool = TRUST_REMOTE_CODE,
 ) -> Tuple[PreTrainedModel, PreTrainedTokenizer]:
     """
     Download (if needed) and load a HuggingFace causal LM + its tokenizer.
@@ -36,9 +37,12 @@ def load_model_and_tokenizer(
     gc.collect()
     torch.cuda.empty_cache()
 
+    if load_in_8bit and load_in_4bit:
+        raise ValueError("Choose either 8-bit or 4-bit loading, not both.")
+
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
-        trust_remote_code=TRUST_REMOTE_CODE,
+        trust_remote_code=trust_remote_code,
     )
 
     if tokenizer.pad_token is None:
@@ -46,7 +50,7 @@ def load_model_and_tokenizer(
 
     kwargs = {
         "device_map": device_map,
-        "trust_remote_code": TRUST_REMOTE_CODE,
+        "trust_remote_code": trust_remote_code,
     }
 
     if load_in_4bit:
@@ -60,7 +64,6 @@ def load_model_and_tokenizer(
     elif load_in_8bit:
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_8bit=True,
-            bnb_8bit_compute_dtype=torch.float16,
         )
         # MUST pass torch_dtype=float16: without it transformers uses the
         # config's bf16 and bitsandbytes re-casts to fp16 on every matmul,
@@ -155,7 +158,9 @@ def get_weight_targets(model: PreTrainedModel, layer_path: str) -> Dict[str, tor
                 obj = getattr(obj, part)
             if isinstance(obj, torch.Tensor) or hasattr(obj, "weight"):
                 w = obj.weight if hasattr(obj, "weight") else obj
-                if w.dim() == 2 and w.shape[0] >= 64 and w.shape[1] >= 64:
+                quant_state = getattr(w, "quant_state", None)
+                logical_shape = getattr(quant_state, "shape", w.shape)
+                if len(logical_shape) == 2 and logical_shape[0] >= 64 and logical_shape[1] >= 64:
                     targets[tag] = w
         except (AttributeError, TypeError):
             continue

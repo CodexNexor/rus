@@ -1,11 +1,9 @@
 """
 RUS Exporter — saves the abliterated model and tokenizer to disk.
 
-Saves via the model's state_dict (sharded safetensors + index) instead of
-save_pretrained. This is required because save_pretrained refuses 8-bit
-quantized (bitsandbytes) models, and it works identically for fp16 models.
-The resulting checkpoint is a standard transformers multi-shard safetensors
-folder loadable with from_pretrained(..., load_in_8bit=True/False).
+Uses Transformers' quantizer-aware ``save_pretrained`` implementation. Manual
+serialization of bitsandbytes internals produces checkpoints whose config and
+weight representation can disagree on reload.
 """
 
 import os
@@ -115,15 +113,22 @@ def export_model(
 
     os.makedirs(export_path, exist_ok=True)
 
-    model.config.save_pretrained(export_path)
-    tokenizer.save_pretrained(export_path)
+    if not ablation_stats:
+        raise RuntimeError("Refusing to export a model with no recorded ablation")
 
-    # state_dict() returns CPU copies — safe for both fp16 and 8-bit models
-    _save_shards(_dedupe_tied(model.state_dict()), export_path)
+    # Transformers owns the serialization contract for quantized checkpoints.
+    # Modern bitsandbytes checkpoints include quantization state that a raw
+    # state_dict writer cannot safely reconstruct.
+    model.save_pretrained(
+        export_path,
+        safe_serialization=True,
+        max_shard_size="5GB",
+    )
+    tokenizer.save_pretrained(export_path)
 
     metadata = {
         "tool": "RUS — Remove Ur Refusal",
-        "version": "1.0.6",
+        "version": "1.1.0",
         "original_model": model_name,
         "exported_at": datetime.now().isoformat(),
         "quantized": any(
@@ -159,5 +164,17 @@ def export_model(
     metadata_path = os.path.join(export_path, "rus_metadata.json")
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
+
+    card_path = os.path.join(export_path, "README.md")
+    with open(card_path, "w") as f:
+        f.write(
+            f"# {safe_name} (RUS)\n\n"
+            f"Derived from `{model_name}` with RUS refusal-direction ablation.\n\n"
+            "## Important use notice\n\n"
+            "This transformation can weaken model safeguards and does not make "
+            "outputs accurate, lawful, or safe. Evaluate the checkpoint in an "
+            "isolated environment before deployment. See `rus_metadata.json` "
+            "for transformation and evaluation details.\n"
+        )
 
     return export_path

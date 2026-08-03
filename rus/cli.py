@@ -2,11 +2,10 @@
 RUS CLI — Beautiful terminal interface for the Remove Ur Refusal engine.
 """
 
-import os
 import sys
 import time
-import copy
 import argparse
+import warnings
 from typing import List
 
 import torch
@@ -16,15 +15,9 @@ from rich.table import Table
 from rich.progress import (
     Progress,
     SpinnerColumn,
-    BarColumn,
     TextColumn,
-    TimeElapsedColumn,
 )
-from rich.text import Text
-from rich.align import Align
 from rich import box
-from rich.live import Live
-from rich.layout import Layout
 
 from .config import (
     DEFAULT_OUTPUT_DIR,
@@ -36,12 +29,16 @@ from .config import (
     LAYER_BLACKLIST_LAST,
     EVAL_HARMFUL_PROMPTS,
 )
-from .prompts import HARMFUL_PROMPTS, HARMLESS_PROMPTS
-from .loader import load_model_and_tokenizer, discover_layers, get_device
+from .prompts import (
+    HARMFUL_PROMPTS, HARMLESS_PROMPTS,
+    EVAL_HARMFUL_PROMPTS as HELDOUT_HARMFUL_PROMPTS,
+    EVAL_HARMLESS_PROMPTS as HELDOUT_HARMLESS_PROMPTS,
+)
+from .loader import load_model_and_tokenizer, discover_layers, get_device, get_hidden_size
 from .collector import collect_pairwise_activations
 from .subspace import compute_refusal_directions, rank_layers, select_best_layers
 from .ablate import apply_ablation
-from .evaluator import run_comparison
+from .evaluator import evaluate_suite, compare_suites
 from .exporter import export_model
 from .tracker import log_run, get_insights
 
@@ -58,7 +55,7 @@ LOGO = r"""[bold bright_magenta]
 ║   ██║  ██║ ╚██████╔╝ ███████║                                ║
 ║   ╚═╝  ╚═╝  ╚═════╝  ╚══════╝                                ║
 ║                                                              ║
-║   Remove Ur Refusal — Living Ablation Engine v1.0.0           ║
+║   Remove Ur Refusal — Living Ablation Engine v1.1.0           ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 [/bold bright_magenta]"""
@@ -225,6 +222,7 @@ def run_pipeline(
     selected_layers_override: List[int] = None,
     load_in_8bit: bool = False,
     load_in_4bit: bool = False,
+    trust_remote_code: bool = False,
 ):
     """
     Execute the complete RUS pipeline:
@@ -253,11 +251,12 @@ def run_pipeline(
             model_name,
             load_in_8bit=load_in_8bit,
             load_in_4bit=load_in_4bit,
+            trust_remote_code=trust_remote_code,
         )
 
     device = get_device(model)
     layer_paths, num_layers = discover_layers(model)
-    hidden_size = model.config.hidden_size
+    hidden_size = get_hidden_size(model)
     console.print(f"  Architecture: [cyan]{num_layers} layers[/], [cyan]{hidden_size}d hidden[/]")
     console.print(f"  ✓ Model loaded on [green]{device}[/]\n")
 
@@ -294,6 +293,13 @@ def run_pipeline(
     table = build_layer_table(directions, selected, top_n=16)
     console.print(table)
     console.print()
+
+    baseline_results = None
+    if not skip_eval:
+        console.print("  Capturing held-out baseline before modifying weights...")
+        baseline_results = evaluate_suite(
+            model, tokenizer, HELDOUT_HARMFUL_PROMPTS, HELDOUT_HARMLESS_PROMPTS
+        )
 
     # ── Step 4: Apply Ablation ─────────────────────────
     console.print("[bold bright_magenta](4/6) Applying weight projection ablation...[/]")
@@ -343,19 +349,10 @@ def run_pipeline(
         console.print("[bold bright_magenta](5/6) Running before/after comparison...")
         console.print(f"  Testing [cyan]{EVAL_HARMFUL_PROMPTS}[/] harmful + harmless prompts")
 
-        model_before, _ = load_model_and_tokenizer(
-            model_name,
-            load_in_8bit=load_in_8bit,
-            load_in_4bit=load_in_4bit,
+        after_results = evaluate_suite(
+            model, tokenizer, HELDOUT_HARMFUL_PROMPTS, HELDOUT_HARMLESS_PROMPTS
         )
-
-        comparison_results = run_comparison(
-            model_before, model, tokenizer,
-            HARMFUL_PROMPTS, HARMLESS_PROMPTS,
-        )
-
-        del model_before
-        torch.cuda.empty_cache()
+        comparison_results = compare_suites(baseline_results, after_results)
 
         comp_table = build_comparison_table(comparison_results)
         console.print(comp_table)
@@ -391,9 +388,10 @@ def run_pipeline(
             export_path=export_path,
             duration_seconds=duration,
             layer_refusal_scores=layer_refusal_scores,
+            ablation_stats=ablation_stats,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        warnings.warn(f"Model exported, but run tracking failed: {exc}")
 
     export_panel = build_export_panel(export_path)
     console.print(export_panel)
@@ -464,8 +462,20 @@ def main():
         action="store_true",
         help="Show learned insights for the model family and exit",
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow custom Python code from the model repository (security-sensitive)",
+    )
 
     args = parser.parse_args()
+
+    if args.load_in_8bit and args.load_in_4bit:
+        parser.error("--8bit and --4bit are mutually exclusive")
+    if not 0.0 < args.coefficient <= 1.0:
+        parser.error("--coefficient must be in (0, 1]")
+    if args.top_k <= 0 or args.num_prompts < 3:
+        parser.error("--top-k must be positive and --num-prompts must be at least 3")
 
     if args.insights and args.model:
         family = args.model.lower()
@@ -505,6 +515,7 @@ def main():
         selected_layers_override=selected_layers,
         load_in_8bit=args.load_in_8bit,
         load_in_4bit=args.load_in_4bit,
+        trust_remote_code=args.trust_remote_code,
     )
 
 

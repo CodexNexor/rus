@@ -8,6 +8,7 @@ from typing import List, Dict
 from tqdm import tqdm
 
 from .config import MAX_MODEL_LENGTH, DEFAULT_BATCH_SIZE
+from .formatting import format_prompt, get_input_device
 
 
 def collect_activations(
@@ -24,14 +25,16 @@ def collect_activations(
     Returns: dict mapping layer_index -> list of activation tensors (one per prompt)
              Each activation tensor has shape (hidden_dim,)
     """
-    device = next(model.parameters()).device
+    if not prompts:
+        return {}
+    device = get_input_device(model)
     model.config.output_hidden_states = True
 
     all_hidden = {}  # layer_idx -> [tensor(batch, hidden_dim), ...]
 
     try:
         for i in tqdm(range(0, len(prompts), batch_size), desc="Collecting activations", unit="batch"):
-            batch_prompts = prompts[i : i + batch_size]
+            batch_prompts = [format_prompt(tokenizer, p) for p in prompts[i : i + batch_size]]
 
             enc = tokenizer(
                 batch_prompts,
@@ -46,7 +49,8 @@ def collect_activations(
                 outputs = model(**enc)
 
             hidden_states = outputs.hidden_states  # tuple (num_layers+1, batch, seq, hidden)
-            last_positions = enc["attention_mask"].sum(dim=1) - 1
+            token_positions = torch.arange(enc["attention_mask"].shape[1], device=device)
+            last_positions = (enc["attention_mask"] * token_positions).argmax(dim=1)
 
             # hidden_states[i] is the input to layer i (i=0: embeddings);
             # hidden_states[i+1] is layer i's OUTPUT. Store under key `i` so the
@@ -54,7 +58,8 @@ def collect_activations(
             for layer_idx, hs in enumerate(hidden_states):
                 if layer_idx == 0:
                     continue
-                last_hidden = hs[range(len(batch_prompts)), last_positions, :]
+                batch_indices = torch.arange(len(batch_prompts), device=hs.device)
+                last_hidden = hs[batch_indices, last_positions.to(hs.device), :]
                 if (layer_idx - 1) not in all_hidden:
                     all_hidden[layer_idx - 1] = []
                 all_hidden[layer_idx - 1].append(last_hidden.cpu())

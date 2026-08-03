@@ -6,7 +6,6 @@ tracking success rates, and building the learning knowledge base.
 import os
 import json
 import sqlite3
-from datetime import datetime
 from typing import Optional, List, Dict
 
 from .config import DB_PATH
@@ -84,6 +83,7 @@ def log_run(
     export_path: Optional[str],
     duration_seconds: float,
     layer_refusal_scores: Dict[int, float],
+    ablation_stats: Optional[Dict] = None,
 ):
     """Log a completed ablation run to the database."""
     init_db()
@@ -117,28 +117,54 @@ def log_run(
     )
     run_id = cursor.lastrowid
 
+    ablation_stats = ablation_stats or {}
     for layer_idx, score in layer_refusal_scores.items():
+        layer_ablation = ablation_stats.get(layer_idx, {})
+        reductions = [
+            target.get("reduction", 0.0)
+            for target in layer_ablation.get("targets", {}).values()
+            if isinstance(target, dict)
+        ]
+        reduction = sum(reductions) / len(reductions) if reductions else None
         conn.execute(
-            """INSERT INTO layer_stats (run_id, layer_idx, refusal_score)
-               VALUES (?, ?, ?)""",
-            (run_id, layer_idx, score),
+            """INSERT INTO layer_stats (
+                   run_id, layer_idx, refusal_score,
+                   coefficient_applied, projection_reduction
+               ) VALUES (?, ?, ?, ?, ?)""",
+            (run_id, layer_idx, score,
+             layer_ablation.get("coefficient"), reduction),
         )
 
     family = _extract_family(model_name)
-    for layer_idx, score in layer_refusal_scores.items():
-        if score >= 0.5:
-            conn.execute(
-                """INSERT INTO model_insights (model_family, best_layers, best_coefficient,
-                   avg_refusal_score_best, num_runs)
-                   VALUES (?, ?, ?, ?, 1)
-                   ON CONFLICT(model_family) DO UPDATE SET
-                   best_layers = json_insert(best_layers, '$[#]', ?),
-                   avg_refusal_score_best = (avg_refusal_score_best * num_runs + ?) / (num_runs + 1),
-                   num_runs = num_runs + 1,
-                   last_updated = CURRENT_TIMESTAMP""",
-                (family, json.dumps([layer_idx]), coefficient, score, layer_idx, score),
-            )
-            break
+    selected = list(layers_modified)
+    selected_scores = [layer_refusal_scores[l] for l in selected if l in layer_refusal_scores]
+    avg_score = sum(selected_scores) / len(selected_scores) if selected_scores else 0.0
+    prior = conn.execute(
+        "SELECT id, avg_refusal_score_best, num_runs FROM model_insights "
+        "WHERE model_family = ? ORDER BY id DESC LIMIT 1",
+        (family,),
+    ).fetchone()
+    if prior:
+        new_count = prior["num_runs"] + 1
+        new_average = (
+            prior["avg_refusal_score_best"] * prior["num_runs"] + avg_score
+        ) / new_count
+        conn.execute(
+            """UPDATE model_insights SET
+                   best_layers = ?, best_coefficient = ?,
+                   avg_refusal_score_best = ?, num_runs = ?,
+                   last_updated = CURRENT_TIMESTAMP
+               WHERE id = ?""",
+            (json.dumps(selected), coefficient, new_average, new_count, prior["id"]),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO model_insights (
+                   model_family, best_layers, best_coefficient,
+                   avg_refusal_score_best, num_runs
+               ) VALUES (?, ?, ?, ?, 1)""",
+            (family, json.dumps(selected), coefficient, avg_score),
+        )
 
     conn.commit()
     conn.close()

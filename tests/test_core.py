@@ -5,8 +5,8 @@ and the sharded exporter. Run: python tests/test_core.py
 
 import os
 import sys
-import shutil
-import json
+import tempfile
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -17,7 +17,7 @@ from rus.ablate import (
     project_direction_from_weight,
     _block_size,
 )
-from rus.exporter import _shard_state_dict, _save_shards
+from rus.exporter import _save_shards
 
 
 class _Int8Param(torch.Tensor):
@@ -90,6 +90,16 @@ def test_projection():
     print(f"PASS test_projection ({before:.4f} -> {after:.4f})")
 
 
+def test_transposed_projection():
+    """Transformers Conv1D stores weights as (input, output)."""
+    torch.manual_seed(11)
+    w = torch.randn(512, 256)
+    v = torch.randn(256)
+    wm = project_direction_from_weight(w, v, coefficient=1.0, output_axis=1)
+    assert (wm @ (v / v.norm())).abs().mean() < 1e-5
+    print("PASS test_transposed_projection")
+
+
 class _Indexable:
     """Emulates nn.ModuleList: getattr(ml, '0') resolves via _modules."""
 
@@ -147,32 +157,29 @@ def test_quantized_ablation_path():
     print(f"PASS test_quantized_ablation_path ({before:.4f} -> {after:.4f})")
 
 
-def test_exporter_shards(tmp="/tmp/rus_export_test"):
-    shutil.rmtree(tmp, ignore_errors=True)
-    os.makedirs(tmp)
-    t = torch.randn(100, 100)
-    state = {
-        "a": t,
-        "b": t[:],  # shared storage — must be deduplicated
-        "c.weight": torch.randn(10, 10),
-    }
-    from rus.exporter import _dedupe_tied
-    deduped = _dedupe_tied(state)
-    assert "b" not in deduped or "a" not in deduped, deduped.keys()
-    with torch.no_grad():
-        weight_map = _save_shards(deduped, tmp)
-    files = sorted(os.listdir(tmp))
-    assert any(f.endswith(".safetensors") for f in files), files
-    if len(files) > 1:
-        assert "model.safetensors.index.json" in files
-    # reload and compare
-    import safetensors.torch as st
-    keys = []
-    for f in files:
-        if f.endswith(".safetensors"):
-            keys += list(st.load_file(os.path.join(tmp, f)).keys())
-    assert sorted(keys) == sorted(deduped.keys()), (sorted(keys), sorted(deduped))
-    shutil.rmtree(tmp, ignore_errors=True)
+def test_exporter_shards():
+    with tempfile.TemporaryDirectory() as tmp:
+        t = torch.randn(100, 100)
+        state = {
+            "a": t,
+            "b": t[:],  # shared storage — must be deduplicated
+            "c.weight": torch.randn(10, 10),
+        }
+        from rus.exporter import _dedupe_tied
+        deduped = _dedupe_tied(state)
+        assert "b" not in deduped or "a" not in deduped, deduped.keys()
+        with torch.no_grad():
+            _save_shards(deduped, tmp)
+        files = sorted(os.listdir(tmp))
+        assert any(f.endswith(".safetensors") for f in files), files
+        if len(files) > 1:
+            assert "model.safetensors.index.json" in files
+        import safetensors.torch as st
+        keys = []
+        for f in files:
+            if f.endswith(".safetensors"):
+                keys += list(st.load_file(os.path.join(tmp, f)).keys())
+        assert sorted(keys) == sorted(deduped.keys()), (sorted(keys), sorted(deduped))
     print("PASS test_exporter_shards")
 
 
@@ -185,6 +192,25 @@ def test_select_best_layers():
     assert [l for l, _, _ in selected] == [2, 3], "rank-based fallback failed"
     assert select_best_layers([], top_k=2) == []
     print("PASS test_select_best_layers")
+
+
+def test_mean_difference_direction():
+    from rus.subspace import compute_refusal_directions
+    torch.manual_seed(12)
+    harmless = torch.randn(32, 16) * 0.2
+    harmful = harmless + torch.tensor([2.0] + [0.0] * 15)
+    result = compute_refusal_directions({0: [harmful]}, {0: [harmless]}, 1)[0]
+    expected = torch.tensor([1.0] + [0.0] * 15)
+    assert torch.dot(result["direction"], expected) > 0.99
+    assert 0.0 <= result["score"] <= 1.0
+    print("PASS test_mean_difference_direction")
+
+
+def test_refusal_detector_avoids_generic_safety_words():
+    from rus.evaluator import detect_refusal
+    assert not detect_refusal("This chemical is dangerous, so wear gloves and goggles.")
+    assert detect_refusal("I cannot assist with that request.")
+    print("PASS test_refusal_detector_avoids_generic_safety_words")
 
 
 def test_quantized_scb_layouts():
@@ -203,6 +229,82 @@ def test_quantized_scb_layouts():
         assert stats["reduction"] > 0.7, stats
         assert isinstance(model.model.layers._items[0].self_attn.o_proj, torch.nn.Linear)
     print("PASS test_quantized_scb_layouts")
+
+
+def test_quantized_multi_target_routing():
+    """o_proj and down_proj must each use their own quantized module."""
+    torch.manual_seed(4)
+    w1 = (torch.randn(256, 256) * 0.02).half()
+    w2 = (torch.randn(256, 512) * 0.02).half()
+    o_proj = FakeBnbModule(*quantize_absmax(w1, 64))
+    down_proj = FakeBnbModule(*quantize_absmax(w2, 64))
+    model = _fake_model_with_module(o_proj)
+    model.model.layers._items[0].mlp.down_proj = down_proj
+    from rus.ablate import apply_ablation_to_layer
+    stats = apply_ablation_to_layer(model, "model.layers.0", torch.randn(256), 0.4)
+    layer = model.model.layers._items[0]
+    assert isinstance(layer.self_attn.o_proj, torch.nn.Linear)
+    assert isinstance(layer.mlp.down_proj, torch.nn.Linear)
+    assert set(stats) == {"o_proj", "down_proj"}
+    print("PASS test_quantized_multi_target_routing")
+
+
+def test_4bit_ablation_path():
+    """NF4 path uses quant_state and replaces the target with fp16 Linear."""
+    torch.manual_seed(5)
+    fp = (torch.randn(256, 256) * 0.02).half()
+
+    class Fake4Bit:
+        bias = None
+        def __init__(self):
+            self.weight = torch.zeros_like(fp, dtype=torch.uint8)
+            self.weight.quant_state = object()
+        def state_dict(self):
+            return {"weight": self.weight}
+
+    functional = types.ModuleType("bitsandbytes.functional")
+    functional.dequantize_4bit = lambda data, quant_state: fp.clone()
+    package = types.ModuleType("bitsandbytes")
+    package.functional = functional
+    old_package = sys.modules.get("bitsandbytes")
+    old_functional = sys.modules.get("bitsandbytes.functional")
+    sys.modules["bitsandbytes"] = package
+    sys.modules["bitsandbytes.functional"] = functional
+    try:
+        model = _fake_model_with_module(Fake4Bit())
+        from rus.ablate import apply_ablation_to_layer
+        stats = apply_ablation_to_layer(model, "model.layers.0", torch.randn(256), 0.8)
+        assert stats["o_proj"]["quantization_bits"] == 4
+        assert isinstance(model.model.layers._items[0].self_attn.o_proj, torch.nn.Linear)
+    finally:
+        if old_package is None:
+            sys.modules.pop("bitsandbytes", None)
+        else:
+            sys.modules["bitsandbytes"] = old_package
+        if old_functional is None:
+            sys.modules.pop("bitsandbytes.functional", None)
+        else:
+            sys.modules["bitsandbytes.functional"] = old_functional
+    print("PASS test_4bit_ablation_path")
+
+
+def test_tracker_upsert():
+    import rus.tracker as tracker
+    old_path = tracker.DB_PATH
+    with tempfile.TemporaryDirectory() as tmp:
+        tracker.DB_PATH = os.path.join(tmp, "experience.db")
+        try:
+            for _ in range(2):
+                tracker.log_run(
+                    "Qwen/test", 8, 1, 0.8, [2], [0.8], {}, None, 1.0,
+                    {2: 0.7},
+                    {2: {"coefficient": 0.8, "targets": {"o_proj": {"reduction": 0.8}}}},
+                )
+            insight = tracker.get_insights("qwen")
+            assert insight["num_runs"] == 2, insight
+        finally:
+            tracker.DB_PATH = old_path
+    print("PASS test_tracker_upsert")
 
 
 def test_apply_ablation_raises_on_failure():
@@ -235,9 +337,15 @@ def test_apply_ablation_raises_on_failure():
 if __name__ == "__main__":
     test_round_trip()
     test_projection()
+    test_transposed_projection()
     test_quantized_ablation_path()
     test_quantized_scb_layouts()
+    test_quantized_multi_target_routing()
+    test_4bit_ablation_path()
     test_apply_ablation_raises_on_failure()
     test_exporter_shards()
     test_select_best_layers()
+    test_mean_difference_direction()
+    test_refusal_detector_avoids_generic_safety_words()
+    test_tracker_upsert()
     print("\nAll tests passed ✓")

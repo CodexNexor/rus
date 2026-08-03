@@ -131,18 +131,27 @@ def _extract_cb_scb(module, sd: Dict) -> tuple:
     """
     Resolve the CB/SCB pair from a bnb 8-bit module, regardless of where bnb
     stashes the scales. Variants seen in the wild:
-      a) state_dict has a "weight.SCB" key,
+      a) state_dict has an "SCB" or "weight.SCB" key,
       b) SCB lives as an attribute on the weight param itself (Int8Params.SCB),
-         and state_dict only exposes "weight".
+      c) CB/SCB have moved to Linear8bitLt.state after the first forward pass.
     Returns (cb, scb) or (None, None) for a non-8-bit module.
     """
+    weight = getattr(module, "weight", None)
+    state = getattr(module, "state", None)
     cb = sd.get("weight")
     if not isinstance(cb, torch.Tensor):
+        cb = getattr(weight, "CB", None)
+    if not isinstance(cb, torch.Tensor):
+        cb = getattr(state, "CB", None)
+    if not isinstance(cb, torch.Tensor):
         return None, None
-    scb = sd.get("weight.SCB")
+    scb = sd.get("SCB")
     if scb is None:
-        w = getattr(module, "weight", None)
-        scb = getattr(w, "SCB", None) if w is not None else None
+        scb = sd.get("weight.SCB")
+    if scb is None:
+        scb = getattr(weight, "SCB", None) if weight is not None else None
+    if scb is None:
+        scb = getattr(state, "SCB", None) if state is not None else None
     if not isinstance(scb, torch.Tensor):
         return None, None
     return cb, scb
@@ -258,7 +267,13 @@ def apply_ablation_to_layer(
             print(f"    [8-bit] {layer_path}.{tag}: cb={tuple(cb.shape)} scb={tuple(scb.shape)}")
             stats[tag] = _ablate_quantized_target(model, layer_path, tag, module, direction, coefficient)
             continue
-        print(f"    [fp16 ] {layer_path}.{tag}: dtype={weight.dtype}")
+        if weight.dtype in (torch.int8, torch.uint8):
+            raise RuntimeError(
+                f"Packed quantized weight at {layer_path}.{tag} has no readable "
+                f"quantization state (state_dict keys={list(sd.keys())}). "
+                "Refusing to treat it as a plain matrix."
+            )
+        print(f"    [plain] {layer_path}.{tag}: dtype={weight.dtype}")
 
         # Plain fp16 path
         direction_dev = direction.to(weight.device, weight.dtype)

@@ -45,10 +45,16 @@ class FakeBnbModule:
         self.bias = None
         if layout == "param_attr":
             self._weight_param = _Int8Param(cb, scb)
+        elif layout == "module_state":
+            self.state = type("State", (), {"CB": cb, "SCB": scb})()
 
     def state_dict(self):
         if self._layout == "param_attr":
             return {"weight": self._weight_param}
+        if self._layout == "module_state":
+            return {"weight": self._cb}
+        if self._layout == "scb_key":
+            return {"weight": self._cb, "SCB": self._scb}
         return {"weight": self._cb, "weight.SCB": self._scb}
 
     @property
@@ -222,13 +228,26 @@ def test_quantized_scb_layouts():
     cb, scb = quantize_absmax(w, 64)
     v = torch.randn(256).half()
 
-    for layout in ("state_dict", "param_attr"):
+    for layout in ("state_dict", "scb_key", "param_attr", "module_state"):
         mod = FakeBnbModule(cb, scb, layout=layout)
         model = _fake_model_with_module(mod)
         stats = _ablate_quantized_target(model, "model.layers.0", "o_proj", mod, v, coefficient=0.8)
         assert stats["reduction"] > 0.7, stats
         assert isinstance(model.model.layers._items[0].self_attn.o_proj, torch.nn.Linear)
     print("PASS test_quantized_scb_layouts")
+
+
+def test_packed_weight_never_uses_plain_path():
+    """Unknown quantization layouts fail clearly before int8 matmul."""
+    mod = FakeBnbModule(torch.zeros(256, 256, dtype=torch.int8), None)
+    model = _fake_model_with_module(mod)
+    from rus.ablate import apply_ablation_to_layer
+    try:
+        apply_ablation_to_layer(model, "model.layers.0", torch.randn(256), 0.8)
+        raise AssertionError("packed int8 weight should have been rejected")
+    except RuntimeError as exc:
+        assert "Packed quantized weight" in str(exc)
+    print("PASS test_packed_weight_never_uses_plain_path")
 
 
 def test_quantized_multi_target_routing():
@@ -340,6 +359,7 @@ if __name__ == "__main__":
     test_transposed_projection()
     test_quantized_ablation_path()
     test_quantized_scb_layouts()
+    test_packed_weight_never_uses_plain_path()
     test_quantized_multi_target_routing()
     test_4bit_ablation_path()
     test_apply_ablation_raises_on_failure()

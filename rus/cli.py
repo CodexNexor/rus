@@ -36,7 +36,10 @@ from .prompts import (
 )
 from .loader import load_model_and_tokenizer, discover_layers, get_device, get_hidden_size
 from .collector import collect_pairwise_activations
-from .subspace import compute_refusal_directions, rank_layers, select_best_layers
+from .subspace import (
+    compute_refusal_directions, rank_layers, select_best_layers,
+    build_consensus_direction,
+)
 from .ablate import apply_ablation
 from .evaluator import evaluate_suite, compare_suites
 from .exporter import export_model
@@ -55,7 +58,7 @@ LOGO = r"""[bold bright_magenta]
 ║   ██║  ██║ ╚██████╔╝ ███████║                                ║
 ║   ╚═╝  ╚═╝  ╚═════╝  ╚══════╝                                ║
 ║                                                              ║
-║   Remove Ur Refusal — Living Ablation Engine v1.1.1           ║
+║   Remove Ur Refusal — Living Ablation Engine v1.2.0           ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 [/bold bright_magenta]"""
@@ -165,6 +168,14 @@ def build_comparison_table(results: dict) -> Table:
         "",
         f"[bold green]{refusal_reduction:+.1%}[/]",
     )
+    kl = results.get("harmless_kl_divergence")
+    if kl is not None:
+        table.add_row(
+            "Harmless KL drift",
+            "0.0000",
+            f"{kl:.4f}",
+            "[green]low[/]" if kl < 0.1 else "[yellow]review[/]",
+        )
 
     return table
 
@@ -222,6 +233,9 @@ def run_pipeline(
     load_in_8bit: bool = False,
     load_in_4bit: bool = False,
     trust_remote_code: bool = False,
+    strategy: str = "global",
+    preserve_norm: bool = True,
+    protect_harmless: bool = True,
 ):
     """
     Execute the complete RUS pipeline:
@@ -274,7 +288,10 @@ def run_pipeline(
     # ── Step 3: Compute Refusal Subspace ───────────────
     console.print("[bold bright_magenta](3/6) Computing refusal subspace...[/]")
 
-    directions = compute_refusal_directions(harmful_acts, harmless_acts, num_layers)
+    directions = compute_refusal_directions(
+        harmful_acts, harmless_acts, num_layers,
+        protect_harmless=protect_harmless,
+    )
     ranked = rank_layers(directions, LAYER_BLACKLIST_FIRST, LAYER_BLACKLIST_LAST)
 
     if selected_layers_override:
@@ -307,8 +324,20 @@ def run_pipeline(
         console.print("[red]No suitable layers found for ablation. Exiting.[/]")
         return
 
-    for rank, (layer_idx, score, direction) in enumerate(selected):
-        coeff = coefficient * (DEFAULT_COEFFICIENT_DECAY ** rank)
+    if strategy == "global":
+        consensus, source_layers = build_consensus_direction(selected, len(selected))
+        ablation_selected = [(l, s, consensus) for l, s, _ in ranked]
+        coefficient_decay = 1.0
+        console.print(
+            f"  Global consensus from layers [cyan]{source_layers}[/] -> "
+            f"[cyan]{len(ablation_selected)}[/] destination layers"
+        )
+    else:
+        ablation_selected = selected
+        coefficient_decay = DEFAULT_COEFFICIENT_DECAY
+
+    for rank, (layer_idx, score, direction) in enumerate(ablation_selected):
+        coeff = coefficient * (coefficient_decay ** rank)
         console.print(
             f"  Layer [cyan]{layer_idx}[/] | "
             f"score=[yellow]{score:.4f}[/] | "
@@ -317,10 +346,11 @@ def run_pipeline(
 
     ablation_stats = apply_ablation(
         model,
-        selected,
+        ablation_selected,
         layer_paths,
         coefficient=coefficient,
-        coefficient_decay=DEFAULT_COEFFICIENT_DECAY,
+        coefficient_decay=coefficient_decay,
+        preserve_norm=preserve_norm,
     )
 
     reductions = []
@@ -367,6 +397,12 @@ def run_pipeline(
     export_path = export_model(
         model, tokenizer, output_dir, model_name,
         ablation_stats, comparison_results,
+        method_metadata={
+            "strategy": strategy,
+            "source_layers": [item[0] for item in selected],
+            "destination_layers": [item[0] for item in ablation_selected],
+            "protect_harmless": protect_harmless,
+        },
     )
 
     duration = time.time() - start_time
@@ -381,8 +417,8 @@ def run_pipeline(
             num_prompts=n_use,
             top_k=top_k,
             coefficient=coefficient,
-            layers_modified=[s[0] for s in selected],
-            coefficients_used=[coefficient * (DEFAULT_COEFFICIENT_DECAY ** r) for r in range(len(selected))],
+            layers_modified=[s[0] for s in ablation_selected],
+            coefficients_used=[coefficient * (coefficient_decay ** r) for r in range(len(ablation_selected))],
             comparison=comparison_results,
             export_path=export_path,
             duration_seconds=duration,
@@ -466,6 +502,24 @@ def main():
         action="store_true",
         help="Allow custom Python code from the model repository (security-sensitive)",
     )
+    parser.add_argument(
+        "--strategy",
+        choices=("global", "per_layer"),
+        default="global",
+        help="Global consensus ablation (paper-aligned) or legacy per-layer top-k",
+    )
+    parser.add_argument(
+        "--no-norm-preserve",
+        action="store_false",
+        dest="preserve_norm",
+        help="Disable post-projection weight-vector norm restoration",
+    )
+    parser.add_argument(
+        "--no-protect-harmless",
+        action="store_false",
+        dest="protect_harmless",
+        help="Keep refusal-direction components parallel to the harmless mean",
+    )
 
     args = parser.parse_args()
 
@@ -515,6 +569,9 @@ def main():
         load_in_8bit=args.load_in_8bit,
         load_in_4bit=args.load_in_4bit,
         trust_remote_code=args.trust_remote_code,
+        strategy=args.strategy,
+        preserve_norm=args.preserve_norm,
+        protect_harmless=args.protect_harmless,
     )
 
 

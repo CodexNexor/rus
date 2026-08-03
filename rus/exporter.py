@@ -96,6 +96,7 @@ def export_model(
     model_name: str,
     ablation_stats: dict,
     comparison_results: dict,
+    method_metadata: dict = None,
 ):
     """
     Save the modified model, tokenizer, and metadata to disk.
@@ -128,17 +129,19 @@ def export_model(
 
     metadata = {
         "tool": "RUS — Remove Ur Refusal",
-        "version": "1.1.1",
+        "version": "1.2.0",
         "original_model": model_name,
         "exported_at": datetime.now().isoformat(),
         "quantized": any(
             p.dtype in (torch.int8, torch.uint8) for p in model.parameters()
         ) if hasattr(model, "parameters") else False,
+        "method": method_metadata or {},
         "ablation_stats": {
             str(k): {
                 "layer_path": v.get("layer_path", ""),
                 "coefficient": v.get("coefficient", 0),
                 "refusal_score": v.get("refusal_score", 0),
+                "preserve_norm": v.get("preserve_norm", False),
                 "targets": {
                     tag: {
                         "projection_before": tv.get("projection_before", 0),
@@ -158,6 +161,7 @@ def export_model(
             "compliance_after": comparison_results.get("compliance_after", 0),
             "quality_before": comparison_results.get("quality_before", 0),
             "quality_after": comparison_results.get("quality_after", 0),
+            "harmless_kl_divergence": comparison_results.get("harmless_kl_divergence"),
         },
     }
 

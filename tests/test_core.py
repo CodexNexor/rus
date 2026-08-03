@@ -106,6 +106,17 @@ def test_transposed_projection():
     print("PASS test_transposed_projection")
 
 
+def test_norm_preserving_projection():
+    torch.manual_seed(13)
+    w = torch.randn(256, 128)
+    v = torch.randn(256)
+    before_norms = w.norm(dim=0)
+    wm = project_direction_from_weight(w, v, coefficient=1.0, preserve_norm=True)
+    assert torch.allclose(wm.norm(dim=0), before_norms, rtol=1e-5, atol=1e-5)
+    assert ((v / v.norm()) @ wm).abs().max() < 1e-5
+    print("PASS test_norm_preserving_projection")
+
+
 class _Indexable:
     """Emulates nn.ModuleList: getattr(ml, '0') resolves via _modules."""
 
@@ -205,11 +216,36 @@ def test_mean_difference_direction():
     torch.manual_seed(12)
     harmless = torch.randn(32, 16) * 0.2
     harmful = harmless + torch.tensor([2.0] + [0.0] * 15)
-    result = compute_refusal_directions({0: [harmful]}, {0: [harmless]}, 1)[0]
+    result = compute_refusal_directions(
+        {0: [harmful]}, {0: [harmless]}, 1, protect_harmless=False
+    )[0]
     expected = torch.tensor([1.0] + [0.0] * 15)
     assert torch.dot(result["direction"], expected) > 0.99
     assert 0.0 <= result["score"] <= 1.0
     print("PASS test_mean_difference_direction")
+
+
+def test_consensus_direction_sign_alignment():
+    from rus.subspace import build_consensus_direction
+    base = torch.tensor([1.0, 0.0, 0.0])
+    ranked = [(3, 0.9, base), (4, 0.8, -base), (5, 0.7, base)]
+    consensus, layers = build_consensus_direction(ranked, 3)
+    assert torch.dot(consensus, base) > 0.999
+    assert layers == [3, 4, 5]
+    print("PASS test_consensus_direction_sign_alignment")
+
+
+def test_comparison_reports_kl_drift():
+    from rus.evaluator import compare_suites
+    before_lp = torch.log_softmax(torch.tensor([[3.0, 1.0, 0.0]]), dim=-1)
+    after_lp = torch.log_softmax(torch.tensor([[2.0, 1.5, 0.0]]), dim=-1)
+    common = {"refusal_rate": 1.0, "compliance": 0.0, "quality": 1.0, "samples": []}
+    result = compare_suites(
+        {**common, "harmless_next_token_logprobs": before_lp},
+        {**common, "harmless_next_token_logprobs": after_lp},
+    )
+    assert result["harmless_kl_divergence"] > 0
+    print("PASS test_comparison_reports_kl_drift")
 
 
 def test_refusal_detector_avoids_generic_safety_words():
@@ -373,6 +409,7 @@ if __name__ == "__main__":
     test_round_trip()
     test_projection()
     test_transposed_projection()
+    test_norm_preserving_projection()
     test_quantized_ablation_path()
     test_quantized_scb_layouts()
     test_packed_weight_never_uses_plain_path()
@@ -382,6 +419,8 @@ if __name__ == "__main__":
     test_exporter_shards()
     test_select_best_layers()
     test_mean_difference_direction()
+    test_consensus_direction_sign_alignment()
+    test_comparison_reports_kl_drift()
     test_refusal_detector_avoids_generic_safety_words()
     test_layer_table_is_ranked_and_shows_selection()
     test_tracker_upsert()

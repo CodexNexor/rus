@@ -32,12 +32,18 @@ path = rus.ablate(
 The pipeline captures a held-out baseline before modifying the in-memory model,
 so quantized evaluation does not require loading a second model onto the GPU.
 
+RUS 1.2 defaults to a sign-aligned, score-weighted global direction applied at
+all compatible residual-writing output projections with norm preservation. See
+[`RESEARCH.md`](RESEARCH.md) for the derivation, assumptions, and references.
+
 ## Supported paths
 
 - Standard fp16/bf16 `nn.Linear` output projections.
 - bitsandbytes 8-bit output projections, replaced with projected fp16 modules.
 - bitsandbytes NF4 4-bit output projections, dequantized and replaced with fp16.
 - GPT-style `Conv1D` output-axis orientation.
+- Global consensus and legacy per-layer ablation strategies.
+- Harmless-direction protection, norm preservation, and held-out KL drift.
 
 Architectures vary. RUS fails explicitly when it cannot discover compatible
 layers or output projections. Successful export is not proof that refusal was

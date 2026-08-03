@@ -20,7 +20,10 @@ from typing import List, Dict, Tuple
 
 from .loader import load_model_and_tokenizer, discover_layers
 from .collector import collect_pairwise_activations
-from .subspace import compute_refusal_directions, rank_layers, select_best_layers
+from .subspace import (
+    compute_refusal_directions, rank_layers, select_best_layers,
+    build_consensus_direction,
+)
 from .ablate import apply_ablation
 from .evaluator import evaluate_suite, compare_suites
 from .exporter import export_model
@@ -75,11 +78,15 @@ class RusEngine:
         self.directions = {}
         self.ranked_layers = []
         self.selected_layers = []
+        self.source_layers = []
+        self.ablation_strategy = ""
         self.ablation_stats = {}
         self.comparison_results = {}
         self.baseline_results = None
         self.export_path = ""
         self._coefficient = DEFAULT_COEFFICIENT
+        self._coefficient_decay = DEFAULT_COEFFICIENT_DECAY
+        self._protect_harmless = True
         self._started_at = time.time()
 
     def load(self) -> "RusEngine":
@@ -93,7 +100,9 @@ class RusEngine:
         self.layer_paths, self.num_layers = discover_layers(self.model)
         return self
 
-    def analyze(self, num_prompts: int = None) -> "RusEngine":
+    def analyze(
+        self, num_prompts: int = None, protect_harmless: bool = True
+    ) -> "RusEngine":
         """
         Collect activations and compute the refusal subspace.
         Call after load().
@@ -113,8 +122,10 @@ class RusEngine:
         )
 
         self.directions = compute_refusal_directions(
-            harmful_acts, harmless_acts, self.num_layers
+            harmful_acts, harmless_acts, self.num_layers,
+            protect_harmless=protect_harmless,
         )
+        self._protect_harmless = protect_harmless
         self._analyzed_prompts = n
 
         self.ranked_layers = rank_layers(
@@ -141,6 +152,8 @@ class RusEngine:
         coefficient: float = None,
         layers: List[int] = None,
         capture_baseline: bool = True,
+        strategy: str = "global",
+        preserve_norm: bool = True,
     ) -> "RusEngine":
         """
         Apply weight projection ablation to top-k layers.
@@ -150,6 +163,9 @@ class RusEngine:
             coefficient: Steering strength (default from config)
             layers: Manual layer list (overrides auto-detection)
             capture_baseline: Cache held-out behavior before in-place modification
+            strategy: ``global`` uses a consensus direction at every eligible
+                destination layer; ``per_layer`` keeps the legacy top-k edit.
+            preserve_norm: Restore each projected weight vector's original norm.
         """
         if self.model is None:
             self.load()
@@ -171,27 +187,47 @@ class RusEngine:
             )
         self._coefficient = coeff
 
+        if strategy not in {"global", "per_layer"}:
+            raise ValueError("strategy must be 'global' or 'per_layer'")
+
         if layers:
             invalid = [l for l in layers if l not in self.directions]
             if invalid:
                 raise ValueError(f"No analyzed direction for layers: {invalid}")
-            self.selected_layers = [
+            source_candidates = [
                 (l, self.directions[l]["score"], self.directions[l]["direction"])
                 for l in layers
                 if l in self.directions
             ]
         else:
-            self.selected_layers = select_best_layers(self.ranked_layers, top_k)
+            source_candidates = select_best_layers(self.ranked_layers, top_k)
 
-        if not self.selected_layers:
+        if not source_candidates:
             raise RuntimeError("No compatible layers were selected for ablation")
+
+        self.source_layers = [item[0] for item in source_candidates]
+        self.ablation_strategy = strategy
+        if strategy == "global":
+            consensus, self.source_layers = build_consensus_direction(
+                source_candidates, len(source_candidates)
+            )
+            self.selected_layers = [
+                (layer_idx, score, consensus)
+                for layer_idx, score, _ in self.ranked_layers
+            ]
+            coefficient_decay = 1.0
+        else:
+            self.selected_layers = source_candidates
+            coefficient_decay = DEFAULT_COEFFICIENT_DECAY
+        self._coefficient_decay = coefficient_decay
 
         self.ablation_stats = apply_ablation(
             self.model,
             self.selected_layers,
             self.layer_paths,
             coefficient=coeff,
-            coefficient_decay=DEFAULT_COEFFICIENT_DECAY,
+            coefficient_decay=coefficient_decay,
+            preserve_norm=preserve_norm,
         )
         return self
 
@@ -225,6 +261,12 @@ class RusEngine:
         self.export_path = export_model(
             self.model, self.tokenizer, out, self.model_name,
             self.ablation_stats, self.comparison_results,
+            method_metadata={
+                "strategy": self.ablation_strategy,
+                "source_layers": self.source_layers,
+                "destination_layers": [item[0] for item in self.selected_layers],
+                "protect_harmless": self._protect_harmless,
+            },
         )
 
         try:
@@ -232,10 +274,10 @@ class RusEngine:
             log_run(
                 model_name=self.model_name,
                 num_prompts=getattr(self, "_analyzed_prompts", len(HARMFUL_PROMPTS)),
-                top_k=len(self.selected_layers),
+                top_k=len(self.source_layers),
                 coefficient=self._coefficient,
                 layers_modified=[s[0] for s in self.selected_layers],
-                coefficients_used=[self._coefficient * (DEFAULT_COEFFICIENT_DECAY ** r) for r in range(len(self.selected_layers))],
+                coefficients_used=[self._coefficient * (self._coefficient_decay ** r) for r in range(len(self.selected_layers))],
                 comparison=self.comparison_results,
                 export_path=self.export_path,
                 duration_seconds=time.time() - self._started_at,
@@ -279,6 +321,9 @@ def ablate(
     output_dir: str = None,
     skip_compare: bool = False,
     trust_remote_code: bool = False,
+    strategy: str = "global",
+    preserve_norm: bool = True,
+    protect_harmless: bool = True,
 ) -> str:
     """
     One-shot: load, analyze, ablate, compare, save.
@@ -293,6 +338,9 @@ def ablate(
         output_dir: Where to save
         skip_compare: Skip before/after comparison
         trust_remote_code: Allow execution of custom code from the model repository
+        strategy: Global consensus or legacy per-layer ablation
+        preserve_norm: Restore projected weight-vector magnitudes
+        protect_harmless: Orthogonalize estimates against harmless mean activations
 
     Returns:
         Path to the saved abliterated model.
@@ -309,10 +357,14 @@ def ablate(
         trust_remote_code=trust_remote_code,
     )
 
-    engine.analyze(num_prompts=num_prompts)
+    engine.analyze(num_prompts=num_prompts, protect_harmless=protect_harmless)
     engine.show_refusal()
 
-    engine.ablate(k=k, coefficient=coefficient, capture_baseline=not skip_compare)
+    engine.ablate(
+        k=k, coefficient=coefficient,
+        capture_baseline=not skip_compare,
+        strategy=strategy, preserve_norm=preserve_norm,
+    )
 
     if not skip_compare:
         engine.compare()

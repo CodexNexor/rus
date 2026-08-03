@@ -129,6 +129,25 @@ def compute_quality_score(
     return sum(scores) / len(scores) if scores else 0.0
 
 
+def compute_next_token_logprobs(model, tokenizer, prompts: List[str]) -> torch.Tensor:
+    """Return held-out next-token distributions for distribution-shift checks."""
+    formatted = [format_prompt(tokenizer, prompt) for prompt in prompts]
+    if not formatted:
+        return torch.empty(0, 0)
+    device = get_input_device(model)
+    enc = tokenizer(
+        formatted, return_tensors="pt", padding=True, truncation=True, max_length=1536
+    )
+    enc = {key: value.to(device) for key, value in enc.items()}
+    positions = torch.arange(enc["attention_mask"].shape[1], device=device)
+    last_positions = (enc["attention_mask"] * positions).argmax(dim=1)
+    with torch.no_grad():
+        logits = model(**enc).logits
+    batch = torch.arange(logits.shape[0], device=logits.device)
+    selected = logits[batch, last_positions.to(logits.device)].float()
+    return torch.log_softmax(selected, dim=-1).cpu()
+
+
 def evaluate_suite(
     model,
     tokenizer,
@@ -143,11 +162,28 @@ def evaluate_suite(
         "compliance": 1.0 - refusal,
         "quality": quality,
         "samples": harmful_results[:5],
+        "harmless_next_token_logprobs": compute_next_token_logprobs(
+            model, tokenizer, harmless_prompts
+        ),
     }
 
 
 def compare_suites(before: Dict, after: Dict) -> Dict:
     """Combine cached before/after evaluations into the public result schema."""
+    before_logprobs = before.get("harmless_next_token_logprobs")
+    after_logprobs = after.get("harmless_next_token_logprobs")
+    kl_divergence = None
+    if (
+        isinstance(before_logprobs, torch.Tensor)
+        and isinstance(after_logprobs, torch.Tensor)
+        and before_logprobs.shape == after_logprobs.shape
+        and before_logprobs.numel() > 0
+    ):
+        probabilities = before_logprobs.exp()
+        kl_divergence = float(
+            (probabilities * (before_logprobs - after_logprobs)).sum(dim=-1).mean()
+        )
+
     return {
         "refusal_rate_before": before["refusal_rate"],
         "refusal_rate_after": after["refusal_rate"],
@@ -158,6 +194,7 @@ def compare_suites(before: Dict, after: Dict) -> Dict:
         "refusal_reduction": before["refusal_rate"] - after["refusal_rate"],
         "sample_results_before": before.get("samples", []),
         "sample_results_after": after.get("samples", []),
+        "harmless_kl_divergence": kl_divergence,
     }
 
 

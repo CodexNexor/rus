@@ -12,6 +12,7 @@ def compute_refusal_directions(
     harmless_acts: Dict[int, List[torch.Tensor]],
     num_layers: int,
     min_refusal_score: float = 0.0,
+    protect_harmless: bool = True,
 ) -> Dict[int, Dict]:
     """
     Compute the mean harmful-minus-harmless direction and an effect score.
@@ -38,8 +39,15 @@ def compute_refusal_directions(
         # Abliteration needs the harmful-vs-harmless mean displacement. PCA on
         # centered differentials instead captures variation *among* prompt pairs
         # and can be orthogonal to the actual class separation.
-        mean_diff = h_harmful.mean(axis=0) - h_harmless.mean(axis=0)
+        harmful_mean = h_harmful.mean(axis=0)
+        harmless_mean = h_harmless.mean(axis=0)
+        mean_diff = harmful_mean - harmless_mean
         direction = torch.from_numpy(mean_diff.astype(np.float32))
+        harmless_direction = torch.from_numpy(harmless_mean.astype(np.float32))
+        if harmless_direction.norm() > 1e-8:
+            harmless_direction = harmless_direction / harmless_direction.norm()
+        if protect_harmless and harmless_direction.norm() > 1e-8:
+            direction = direction - torch.dot(direction, harmless_direction) * harmless_direction
         if not torch.isfinite(direction).all() or direction.norm() < 1e-8:
             continue
         direction = direction / direction.norm()
@@ -58,6 +66,10 @@ def compute_refusal_directions(
             "direction": direction,
             "score": score,
             "effect_size": effect,
+            "harmless_overlap": float(
+                torch.dot(direction, harmless_direction).abs()
+                if harmless_direction.norm() > 1e-8 else 0.0
+            ),
         }
 
     return results
@@ -106,3 +118,37 @@ def select_best_layers(
     if not selected:
         return ranked[:top_k]
     return selected[:top_k]
+
+
+def build_consensus_direction(
+    ranked: List[Tuple[int, float, torch.Tensor]],
+    top_n: int = 5,
+) -> Tuple[torch.Tensor, List[int]]:
+    """Build a stable global direction from sign-aligned top layer estimates.
+
+    Residual-stream bases are shared across transformer blocks, but empirical
+    directions can flip sign and contain layer-specific noise. Aligning each
+    candidate to the best-scoring reference and taking a score-weighted mean
+    reduces that noise without increasing the erased subspace rank.
+    """
+    if top_n <= 0:
+        raise ValueError("top_n must be positive")
+    candidates = ranked[:top_n]
+    if not candidates:
+        raise ValueError("Cannot build a consensus from no directions")
+    reference = candidates[0][2].float()
+    reference = reference / reference.norm().clamp_min(1e-12)
+    aligned = []
+    weights = []
+    layers = []
+    for layer_idx, score, direction in candidates:
+        unit = direction.float() / direction.float().norm().clamp_min(1e-12)
+        if torch.dot(unit, reference) < 0:
+            unit = -unit
+        aligned.append(unit)
+        weights.append(max(float(score), 1e-6))
+        layers.append(layer_idx)
+    weight_tensor = torch.tensor(weights, dtype=torch.float32)
+    consensus = (torch.stack(aligned) * weight_tensor[:, None]).sum(dim=0)
+    consensus = consensus / consensus.norm().clamp_min(1e-12)
+    return consensus, layers

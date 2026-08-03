@@ -25,6 +25,7 @@ def project_direction_from_weight(
     direction: torch.Tensor,
     coefficient: float = 0.8,
     output_axis: int = 0,
+    preserve_norm: bool = False,
 ) -> torch.Tensor:
     """
     Remove the component of `direction` from each column of `weight`.
@@ -46,6 +47,9 @@ def project_direction_from_weight(
     v_hat = direction / (direction.norm() + 1e-12)
     v_hat = v_hat.to(weight.device, weight.dtype)
 
+    norm_dim = 0 if output_axis == 0 else 1
+    original_norms = weight.float().norm(dim=norm_dim) if preserve_norm else None
+
     if output_axis == 0:
         if weight.shape[0] != v_hat.numel():
             raise ValueError(f"direction has {v_hat.numel()} values for weight {tuple(weight.shape)}")
@@ -58,6 +62,16 @@ def project_direction_from_weight(
         weight_modified = weight - coefficient * torch.outer(row_projections, v_hat)
     else:
         raise ValueError("output_axis must be 0 or 1")
+
+    # Positive rescaling cannot reintroduce a removed output direction because
+    # every affected column (or Conv1D row) remains in the same projected ray.
+    if preserve_norm:
+        modified_norms = weight_modified.float().norm(dim=norm_dim).clamp_min(1e-12)
+        scales = (original_norms / modified_norms).to(weight_modified.dtype)
+        if output_axis == 0:
+            weight_modified = weight_modified * scales.unsqueeze(0)
+        else:
+            weight_modified = weight_modified * scales.unsqueeze(1)
 
     return weight_modified
 
@@ -158,7 +172,7 @@ def _extract_cb_scb(module, sd: Dict) -> tuple:
 
 
 def _ablate_quantized_target(model, layer_path: str, tag: str, module, direction: torch.Tensor,
-                             coefficient: float) -> Dict[str, float]:
+                             coefficient: float, preserve_norm: bool = False) -> Dict[str, float]:
     """Dequantize (via module.state_dict) → project → swap in fp16 Linear."""
     sd = module.state_dict()
     cb, scb = _extract_cb_scb(module, sd)
@@ -172,7 +186,9 @@ def _ablate_quantized_target(model, layer_path: str, tag: str, module, direction
     dir_fp16 = direction.to(fp16.device, torch.float16)
 
     proj_before = (dir_fp16 @ fp16).abs().mean().item()
-    fp16_modified = project_direction_from_weight(fp16, dir_fp16, coefficient)
+    fp16_modified = project_direction_from_weight(
+        fp16, dir_fp16, coefficient, preserve_norm=preserve_norm
+    )
     proj_after = (dir_fp16 @ fp16_modified).abs().mean().item()
 
     bias = None
@@ -184,7 +200,7 @@ def _ablate_quantized_target(model, layer_path: str, tag: str, module, direction
     # VERIFY: the live module now holds weights with the direction removed.
     # Plain fp16 weights — measurement is deterministic, no bnb layout tricks.
     check_proj = (dir_fp16 @ new_module.weight).abs().mean().item()  # module now nn.Linear
-    expected = proj_before * abs(1.0 - coefficient)
+    expected = proj_after
     tolerance = max(proj_before * 0.08, 2e-5)
     if abs(check_proj - expected) > tolerance:
         raise RuntimeError(
@@ -201,7 +217,8 @@ def _ablate_quantized_target(model, layer_path: str, tag: str, module, direction
 
 
 def _ablate_4bit_target(model, layer_path: str, tag: str, module,
-                        direction: torch.Tensor, coefficient: float) -> Dict[str, float]:
+                        direction: torch.Tensor, coefficient: float,
+                        preserve_norm: bool = False) -> Dict[str, float]:
     """Dequantize a bitsandbytes Params4bit weight and replace it with fp16."""
     weight = module.weight
     quant_state = getattr(weight, "quant_state", None)
@@ -220,7 +237,9 @@ def _ablate_4bit_target(model, layer_path: str, tag: str, module,
             f"{dir_fp16.numel()} vs {tuple(fp16.shape)}"
         )
     before = (dir_fp16 @ fp16).abs().mean().item()
-    modified = project_direction_from_weight(fp16, dir_fp16, coefficient)
+    modified = project_direction_from_weight(
+        fp16, dir_fp16, coefficient, preserve_norm=preserve_norm
+    )
     after = (dir_fp16 @ modified).abs().mean().item()
     bias = getattr(module, "bias", None)
     if bias is not None:
@@ -240,6 +259,7 @@ def apply_ablation_to_layer(
     layer_path: str,
     direction: torch.Tensor,
     coefficient: float = 0.8,
+    preserve_norm: bool = False,
 ) -> Dict[str, float]:
     """
     Apply refusal-direction projection to all modifiable weight targets in a layer.
@@ -257,7 +277,7 @@ def apply_ablation_to_layer(
 
         if getattr(getattr(module, "weight", None), "quant_state", None) is not None:
             stats[tag] = _ablate_4bit_target(
-                model, layer_path, tag, module, direction, coefficient
+                model, layer_path, tag, module, direction, coefficient, preserve_norm
             )
             continue
 
@@ -265,7 +285,9 @@ def apply_ablation_to_layer(
         cb, scb = _extract_cb_scb(module, sd)
         if cb is not None and scb is not None:  # bnb 8-bit module (either layout)
             print(f"    [8-bit] {layer_path}.{tag}: cb={tuple(cb.shape)} scb={tuple(scb.shape)}")
-            stats[tag] = _ablate_quantized_target(model, layer_path, tag, module, direction, coefficient)
+            stats[tag] = _ablate_quantized_target(
+                model, layer_path, tag, module, direction, coefficient, preserve_norm
+            )
             continue
         if weight.dtype in (torch.int8, torch.uint8):
             raise RuntimeError(
@@ -284,7 +306,8 @@ def apply_ablation_to_layer(
         ).abs().mean().item()
 
         weight_modified = project_direction_from_weight(
-            weight, direction_dev, coefficient, output_axis=output_axis
+            weight, direction_dev, coefficient, output_axis=output_axis,
+            preserve_norm=preserve_norm,
         )
 
         with torch.no_grad():
@@ -323,6 +346,7 @@ def apply_ablation(
     layer_paths: List[str],
     coefficient: float = 0.8,
     coefficient_decay: float = 0.75,
+    preserve_norm: bool = False,
 ) -> Dict:
     """
     Apply weight-projection ablation to all selected layers.
@@ -349,11 +373,14 @@ def apply_ablation(
 
         # NOTE: errors propagate on purpose. A silently-failed ablation would
         # save an unmodified model and fake the whole run.
-        stats = apply_ablation_to_layer(model, layer_path, direction, coeff)
+        stats = apply_ablation_to_layer(
+            model, layer_path, direction, coeff, preserve_norm=preserve_norm
+        )
         all_stats[layer_idx] = {
             "layer_path": layer_path,
             "coefficient": coeff,
             "refusal_score": refusal_score,
+            "preserve_norm": preserve_norm,
             "targets": stats,
         }
 

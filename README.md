@@ -36,19 +36,19 @@ RUS 1.3 defaults to a sign-aligned, score-weighted global direction applied at
 all compatible residual-writing output projections with norm preservation. See
 [`RESEARCH.md`](RESEARCH.md) for the derivation, assumptions, and references.
 
-## Kaggle: Qwen2.5 7B on two T4 GPUs
+## Kaggle: DeepSeek-R1 Distill Qwen 14B on two T4 GPUs
 
-Open [`rus_kaggle_dual_t4_7b.ipynb`](rus_kaggle_dual_t4_7b.ipynb) in a Kaggle
-GPU notebook and select the **GPU T4 x2** accelerator. The notebook loads the
-7B checkpoint in 8-bit mode, balances transformer modules over both GPUs,
-prints per-GPU memory use, verifies placement, runs the pipeline, then reloads
-the exported checkpoint and performs a real forward pass. If Kaggle assigns
-only one GPU, the notebook automatically uses a single-GPU 7B fallback.
+Open [`rus_kaggle_dual_t4_14b.ipynb`](rus_kaggle_dual_t4_14b.ipynb) in a Kaggle
+GPU notebook and select the **GPU T4 x2** accelerator. The notebook loads
+`deepseek-ai/DeepSeek-R1-Distill-Qwen-14B` in 4-bit mode, balances transformer
+modules over both GPUs, prints per-GPU memory use, verifies placement, runs the
+pipeline, then reloads the exported checkpoint and performs a real forward
+pass. This larger workflow intentionally requires two GPUs.
 
 The equivalent CLI settings are:
 
 ```bash
-rus Qwen/Qwen2.5-7B-Instruct --8bit \
+rus deepseek-ai/DeepSeek-R1-Distill-Qwen-14B --4bit \
   --device-map balanced \
   --max-memory 0=12GiB,1=13GiB,cpu=24GiB \
   --num-prompts 48 --top-k 5
@@ -83,4 +83,4 @@ python -m pytest -q
 ```
 
 The older single-GPU Colab workflow remains in `rus_colab_llama.ipynb`; use the
-Kaggle notebook above for the dual-T4 7B test.
+Kaggle notebook above for the dual-T4 14B test.

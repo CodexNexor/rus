@@ -219,6 +219,22 @@ def test_refusal_detector_avoids_generic_safety_words():
     print("PASS test_refusal_detector_avoids_generic_safety_words")
 
 
+def test_layer_table_is_ranked_and_shows_selection():
+    from rich.console import Console
+    from rus.cli import build_layer_table
+    directions = {
+        i: {"score": i / 32.0, "direction": torch.randn(8)} for i in range(32)
+    }
+    selected = [(27, directions[27]["score"], directions[27]["direction"])]
+    table = build_layer_table(directions, selected, top_n=5)
+    console = Console(record=True, width=100)
+    console.print(table)
+    rendered = console.export_text()
+    assert "27" in rendered and "SELECTED" in rendered
+    assert "│     2 │" not in rendered  # numeric-order layer 2 must not displace top ranks
+    print("PASS test_layer_table_is_ranked_and_shows_selection")
+
+
 def test_quantized_scb_layouts():
     """Works regardless of where bnb stashes CB/SCB (state_dict key or param attr)."""
     from rus.ablate import _ablate_quantized_target
@@ -367,5 +383,6 @@ if __name__ == "__main__":
     test_select_best_layers()
     test_mean_difference_direction()
     test_refusal_detector_avoids_generic_safety_words()
+    test_layer_table_is_ranked_and_shows_selection()
     test_tracker_upsert()
     print("\nAll tests passed ✓")

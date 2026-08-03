@@ -90,32 +90,31 @@ def build_layer_table(
     skip_first = LAYER_BLACKLIST_FIRST
     skip_last = LAYER_BLACKLIST_LAST
 
-    shown = 0
-    for layer_idx in range(total_layers):
-        if shown >= top_n:
-            break
-        if layer_idx < skip_first or layer_idx >= total_layers - skip_last:
-            continue
+    eligible = [
+        (layer_idx, info)
+        for layer_idx, info in directions.items()
+        if skip_first <= layer_idx < total_layers - skip_last
+    ]
+    eligible.sort(key=lambda item: item[1]["score"], reverse=True)
 
-        if layer_idx in directions:
-            score = directions[layer_idx]["score"]
-            bar_len = int(score * 20)
-            bar = "[bright_green]" + "█" * bar_len + "[/]" + "░" * (20 - bar_len)
+    for layer_idx, info in eligible[:top_n]:
+        score = info["score"]
+        bar_len = int(score * 20)
+        bar = "[bright_green]" + "█" * bar_len + "[/]" + "░" * (20 - bar_len)
 
-            if layer_idx in selected_layers:
-                status = "[bold bright_yellow]★ SELECTED[/]"
-            elif score >= 0.5:
-                status = "[dim]candidate[/]"
-            else:
-                status = "[dim]low signal[/]"
+        if layer_idx in selected_layers:
+            status = "[bold bright_yellow]★ SELECTED[/]"
+        elif score >= 0.5:
+            status = "[dim]candidate[/]"
+        else:
+            status = "[dim]low signal[/]"
 
-            table.add_row(
-                str(layer_idx),
-                f"{score:.4f}",
-                bar,
-                status,
-            )
-            shown += 1
+        table.add_row(
+            str(layer_idx),
+            f"{score:.4f}",
+            bar,
+            status,
+        )
 
     return table
 
